@@ -49,7 +49,7 @@ from dotenv import load_dotenv
 # §1. 定数定義
 # ============================================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-VERSION = "5.400"  # CLOSE凍結 + TP/RR Gate + spread_anomaly独立
+VERSION = "5.401"  # G7修正: TP必須+方向チェック+RR完全閉鎖
 
 # --- 通貨ペア ---
 SYMBOL = "USDJPY"
@@ -1848,15 +1848,21 @@ def check_post_signal_gate(action: str, entry_price: float, sl_price: float,
         if bb_w < 50.0 and sma_a < 30.0:
             return False, f"M30スクイーズ: BB幅{bb_w:.1f}pip, SMA角度{sma_a:.1f}度"
 
-    # G7: 最低RR比（TP:SL >= 1.5:1）— VMA「損小利大」原則
-    if tp_price > 0 and sl_pips > 0:
-        tp_pips = price_to_pips(abs(tp_price - entry_price))
+    # G7: TP必須 + TP方向チェック + 最低RR比（TP:SL >= 1.5:1）
+    if action in ("BUY", "SELL"):
+        # TP未指定は拒否（憲章・schema両方でrequired）
+        if tp_price <= 0:
+            return False, "TP未指定: BUY/SELLにはTP（利確目標）が必須"
+        # TP方向チェック: BUYならtp>entry、SELLならtp<entry
+        if action == "BUY" and tp_price <= entry_price:
+            return False, f"TP方向逆転: BUYなのにTP({tp_price})≦entry({entry_price})"
+        if action == "SELL" and tp_price >= entry_price:
+            return False, f"TP方向逆転: SELLなのにTP({tp_price})≧entry({entry_price})"
+        # RR比チェック
+        tp_pips = price_to_pips(tp_price - entry_price) if action == "BUY" else price_to_pips(entry_price - tp_price)
         rr_ratio = tp_pips / sl_pips if sl_pips > 0 else 0
         if rr_ratio < GATE_MIN_RR_RATIO:
             return False, f"RR比不足: {rr_ratio:.2f} < 最低{GATE_MIN_RR_RATIO}（TP {tp_pips:.1f}pip / SL {sl_pips:.1f}pip）"
-    elif tp_price <= 0 and action in ("BUY", "SELL"):
-        # TPなしの場合: 警告ログのみ（拒否はしない。Geminiが省略する場合がある）
-        logging.warning(f"【Gate警告】TP未指定。RR比チェックをスキップ。")
 
     logging.info(f"【Gate APPROVED】{action} entry={entry_price} sl={sl_price} tp={tp_price} sl_pips={sl_pips:.1f}")
     return True, ""
@@ -2126,6 +2132,7 @@ def main_loop() -> None:
                 if is_b and not is_restricted_time(now) and not entry_blocked_by_anomaly:
                     # B'フラグ記録（Geminiは呼ばない）
                     # ★最新優先: TTL内でも新しい急変動が来たら上書きする
+                    is_overwrite = hasattr(state, '_rapid_move_flag') and state._rapid_move_flag is not None
                     r1 = mt5.copy_rates_from_pos(SYMBOL, mt5.TIMEFRAME_M1, 0, 5)
                     b_dir = "UNKNOWN"
                     b_cum_pips = 0.0
@@ -2140,7 +2147,7 @@ def main_loop() -> None:
                         "cumulative_pips": b_cum_pips,
                     }
                     logging.info(
-                        f"【B'フラグ】急変動検知 → フラグ{'上書き' if hasattr(state, '_rapid_move_flag') else '記録'} "
+                        f"【B'フラグ】急変動検知 → {'上書き' if is_overwrite else '新規記録'} "
                         f"(方向={b_dir}, 累積={b_cum_pips}pips)")
 
                 if not is_c:
