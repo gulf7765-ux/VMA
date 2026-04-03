@@ -1,5 +1,5 @@
 """
-VMA - VM Advance Trading System v5.200
+VMA - VM Advance Trading System v5.300
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 BB背景分析最優先 × Gemini合議 × Python側異常ガード
 
@@ -49,7 +49,7 @@ from dotenv import load_dotenv
 # §1. 定数定義
 # ============================================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-VERSION = "5.200"  # 幻DD自爆修正 + B'修正 + DD4層entry_allowed修正
+VERSION = "5.300"  # DDバイパスspread限定 + B'上書き + PostSignalGate
 
 # --- 通貨ペア ---
 SYMBOL = "USDJPY"
@@ -277,16 +277,18 @@ class AnomalyGuard:
         """
         Returns:
             {
-                "block_entry": bool,        # 新規エントリー禁止
-                "freeze_market_orders": bool, # 成行決済操作凍結(タイムストップ/状態C CLOSE)
-                "tick_frozen": bool,        # ティック凍結
-                "manual_locked": bool,      # 手動解除ロック中
+                "block_entry": bool,          # 新規エントリー禁止
+                "freeze_market_orders": bool,  # 成行決済操作凍結
+                "spread_anomaly": bool,        # ★スプレッド起因の異常（DD判定バイパス用）
+                "tick_frozen": bool,
+                "manual_locked": bool,
                 "alerts": [str, ...],
             }
         """
         result = {
             "block_entry": False,
             "freeze_market_orders": False,
+            "spread_anomaly": False,
             "tick_frozen": False,
             "manual_locked": False,
             "alerts": [],
@@ -314,10 +316,11 @@ class AnomalyGuard:
             if len(self._spread_history) > 30:
                 self._spread_history = self._spread_history[-30:]
 
-            # --- 1. スプレッド監視（成行決済は行わない）---
+            # --- 1. スプレッド監視 ---
             if spread_pips >= SPREAD_BLOCK_PIPS:
                 result["block_entry"] = True
-                result["freeze_market_orders"] = True  # 成行操作凍結
+                result["freeze_market_orders"] = True
+                result["spread_anomaly"] = True  # ★spread起因を明示
                 is_anomaly = True
                 self._normal_tick_streak = 0
                 result["alerts"].append(
@@ -1788,9 +1791,69 @@ def sanitize_gemini_output(text: str, max_length: int = 5000) -> str:
 # ============================================================================
 # §19. アクション処理
 # ============================================================================
+# §19a. PostSignalGate（エントリー前関門）— PhantomOS準拠
+# ============================================================================
+def check_post_signal_gate(action: str, entry_price: float, sl_price: float,
+                           state: BotState, anomaly_result: Dict[str, Any]) -> Tuple[bool, str]:
+    """
+    Geminiが返したBUY/SELLをPython側で物理的にチェック。
+    幻覚（あり得ないロット/逆方向SL等）を遮断する最後の防衛線。
+    """
+    # G1: SL方向
+    if action == "BUY" and sl_price >= entry_price:
+        return False, f"SL方向逆転: BUYでSL({sl_price})≧entry({entry_price})"
+    if action == "SELL" and sl_price <= entry_price:
+        return False, f"SL方向逆転: SELLでSL({sl_price})≦entry({entry_price})"
+
+    # G2: SL距離（最小/最大）
+    sl_pips = price_to_pips(abs(entry_price - sl_price))
+    if sl_pips < MIN_SL_PIPS:
+        return False, f"SL幅不足: {sl_pips:.1f}pips < {MIN_SL_PIPS}"
+    if sl_pips > SL_MAX_DISTANCE_PIPS:
+        return False, f"SL幅過大: {sl_pips:.1f}pips > {SL_MAX_DISTANCE_PIPS}"
+
+    # G3: リスク金額（資金の3%以内）
+    acc = mt5.account_info()
+    if acc:
+        info = mt5.symbol_info(SYMBOL)
+        if info and info.trade_tick_size > 0:
+            diff = abs(entry_price - sl_price)
+            loss_per_lot = (diff / info.trade_tick_size) * info.trade_tick_value
+            if loss_per_lot > 0:
+                max_lot = (acc.balance * GATE_MAX_RISK_PCT) / loss_per_lot
+                if max_lot < info.volume_min:
+                    return False, f"リスク超過: 最小ロットでも資金{GATE_MAX_RISK_PCT*100:.0f}%超"
+
+    # G4: スプレッド正常性
+    if anomaly_result.get("block_entry", False):
+        return False, "異常ガードによるエントリー禁止中"
+
+    # G5: 既存ポジション重複
+    positions = mt5.positions_get(symbol=SYMBOL)
+    if positions:
+        for pos in positions:
+            if pos.magic == MAGIC_NUMBER:
+                return False, f"既存ポジションあり: Ticket {pos.ticket}"
+
+    # G6: M30スクイーズ（BB幅50pip未満 & SMA角度30度未満）
+    m30 = fetch_and_calc_labels(mt5.TIMEFRAME_M30)
+    if m30:
+        bb_w = m30.get("BB_WIDTH_PIPS", 0)
+        sma_a = abs(m30.get("SMA21_ANGLE", 0))
+        if bb_w < 50.0 and sma_a < 30.0:
+            return False, f"M30スクイーズ: BB幅{bb_w:.1f}pip, SMA角度{sma_a:.1f}度"
+
+    logging.info(f"【Gate APPROVED】{action} entry={entry_price} sl={sl_price} sl_pips={sl_pips:.1f}")
+    return True, ""
+
+
+# ============================================================================
+# §19b. アクション処理
+# ============================================================================
 def handle_action(action: str, sl: float, has_pos: bool, p: Any, decision: str,
-                  is_entry_allowed: bool, state: BotState, council_label: str = "") -> None:
-    """Gemini合議結果に基づきトレードを実行"""
+                  is_entry_allowed: bool, state: BotState, council_label: str = "",
+                  anomaly_result: Optional[Dict[str, Any]] = None) -> None:
+    """Gemini合議結果に基づきトレードを実行（PostSignalGate統合）"""
     if action == "CLOSE" and has_pos:
         if close_position(p.ticket, p.type, p.volume):
             tracker = state.open_trades.pop(p.ticket, None)
@@ -1817,7 +1880,6 @@ def handle_action(action: str, sl: float, has_pos: bool, p: Any, decision: str,
             return
         entry = tick.ask if action == "BUY" else tick.bid
         if sl <= 0:
-            # SLフォールバック: ATR×1.5
             rates = mt5.copy_rates_from_pos(SYMBOL, mt5.TIMEFRAME_M30, 0, 30)
             if rates is not None and len(rates) >= 30:
                 atr = calculate_atr(pd.DataFrame(rates)).iloc[-1]
@@ -1826,9 +1888,12 @@ def handle_action(action: str, sl: float, has_pos: bool, p: Any, decision: str,
             if sl <= 0:
                 sl = round(entry - pips_to_price(MIN_SL_PIPS) if action == "BUY" else entry + pips_to_price(MIN_SL_PIPS), 3)
 
-        if action == "BUY" and sl >= entry:
-            return
-        if action == "SELL" and sl <= entry:
+        # ★PostSignalGate: エントリー前の最終関門
+        gate_ok, gate_reason = check_post_signal_gate(
+            action, entry, sl, state, anomaly_result or {})
+        if not gate_ok:
+            logging.warning(f"【Gate REJECTED】{gate_reason}")
+            send_line_notify(f"⛔ エントリー拒否\n{gate_reason}")
             return
 
         success, vol, pr, risk = execute_trade(
@@ -1952,18 +2017,21 @@ def main_loop() -> None:
                         evt_type, spread, "; ".join(anomaly["alerts"]))
 
                 # --- DD4層チェック（PhantomOS DDMonitor準拠）---
-                # ★Blocker対応: freeze_market中はDD DISQUALIFYの成行全決済をバイパス。
-                #   スプレッド拡大による「幻のDD20%」で自爆するのを防ぐ。
+                # ★Blocker対応: spread異常中のみDD DISQUALIFYの成行全決済をバイパス。
+                #   freeze_market_orders全般ではなく、spread_anomaly限定。
+                #   手動ロック中やHALT復帰待ち中の実DDは正しく検出・退場させる。
                 freeze_market = anomaly["freeze_market_orders"]
+                spread_is_abnormal = anomaly["spread_anomaly"]
                 dd_pct = get_dd_percent(state)
                 dd_stage = get_dd_stage(dd_pct)
                 if dd_stage == "DISQUALIFY":
-                    if freeze_market:
-                        # スプレッド異常中: 成行決済せずログのみ。正常復帰後に再判定。
+                    if spread_is_abnormal:
+                        # スプレッド異常中のみ: 成行決済せずログ。正常復帰後に再判定。
                         logging.warning(
                             f"【DD4層】DD {dd_pct:.1f}% ≧ {DD_DISQUALIFY_PCT}% だが "
                             f"スプレッド異常中のため成行全決済をバイパス。正常復帰後に再判定。")
                     else:
+                        # スプレッド正常 or それ以外の停止理由: 本当のDD → 退場
                         logging.critical(f"【DD DISQUALIFY】DD {dd_pct:.1f}% → 全決済+停止")
                         close_all_positions_safely(state, "dd_disqualify")
                         phase_mgr.transition("dd_lock")
@@ -2036,24 +2104,23 @@ def main_loop() -> None:
 
                 if is_b and not is_restricted_time(now) and not entry_blocked_by_anomaly:
                     # B'フラグ記録（Geminiは呼ばない）
-                    if not hasattr(state, '_rapid_move_flag') or state._rapid_move_flag is None:
-                        # 方向と累積移動量をM1データから取得
-                        r1 = mt5.copy_rates_from_pos(SYMBOL, mt5.TIMEFRAME_M1, 0, 5)
-                        b_dir = "UNKNOWN"
-                        b_cum_pips = 0.0
-                        if r1 is not None and len(r1) >= 3:
-                            move = r1[-1]["close"] - r1[-3]["close"]
-                            b_dir = "UP" if move > 0 else "DOWN"
-                            b_cum_pips = round(abs(price_to_pips(move)), 1)
-                        state._rapid_move_flag = {
-                            "time": now.isoformat(),
-                            "timestamp": time.time(),
-                            "direction": b_dir,
-                            "cumulative_pips": b_cum_pips,
-                        }
-                        logging.info(
-                            f"【B'フラグ】急変動検知 → フラグ記録のみ "
-                            f"(方向={b_dir}, 累積={b_cum_pips}pips)")
+                    # ★最新優先: TTL内でも新しい急変動が来たら上書きする
+                    r1 = mt5.copy_rates_from_pos(SYMBOL, mt5.TIMEFRAME_M1, 0, 5)
+                    b_dir = "UNKNOWN"
+                    b_cum_pips = 0.0
+                    if r1 is not None and len(r1) >= 3:
+                        move = r1[-1]["close"] - r1[-3]["close"]
+                        b_dir = "UP" if move > 0 else "DOWN"
+                        b_cum_pips = round(abs(price_to_pips(move)), 1)
+                    state._rapid_move_flag = {
+                        "time": now.isoformat(),
+                        "timestamp": time.time(),
+                        "direction": b_dir,
+                        "cumulative_pips": b_cum_pips,
+                    }
+                    logging.info(
+                        f"【B'フラグ】急変動検知 → フラグ{'上書き' if hasattr(state, '_rapid_move_flag') else '記録'} "
+                        f"(方向={b_dir}, 累積={b_cum_pips}pips)")
 
                 if not is_c:
                     state.last_state_c_check = None
@@ -2110,7 +2177,7 @@ def main_loop() -> None:
                     entry_allowed = (is_entry_window(now) and not is_restricted_time(now)
                                      and not entry_blocked_by_anomaly
                                      and dd_stage not in ("HALT", "DISQUALIFY"))
-                    handle_action(act, sl_val, has_pos, p, decision, entry_allowed, state, council_label)
+                    handle_action(act, sl_val, has_pos, p, decision, entry_allowed, state, council_label, anomaly)
                     state.save()
 
                 time.sleep(MAIN_LOOP_INTERVAL)
