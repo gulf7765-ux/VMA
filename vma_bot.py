@@ -1,5 +1,5 @@
 """
-VMA - VM Advance Trading System v5.500
+VMA - VM Advance Trading System v5.501
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 BB背景分析最優先 × Gemini合議 × Python側異常ガード
 
@@ -50,7 +50,7 @@ from dotenv import load_dotenv
 # §1. 定数定義
 # ============================================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-VERSION = "5.500"  # §21 SelfDestructionMonitor追加
+VERSION = "5.501"  # §21 SDM修正: G-M1/G-M2/P-M1/G-m1/P-m2対応
 
 # --- 通貨ペア ---
 SYMBOL = "USDJPY"
@@ -132,13 +132,11 @@ SDM_CHECK_INTERVAL_SECONDS = 300   # 定期チェック間隔 (5分)
 # CAUTION閾値
 SDM_WIN_RATE_CAUTION = 0.35        # 勝率35%未満で注意
 SDM_CONSECUTIVE_LOSS_CAUTION = 3   # 3連敗で注意
-SDM_CONSECUTIVE_WAIT_CAUTION = 8   # 連続WAIT 8回で注意
 SDM_SL_HIT_RATE_CAUTION = 0.60     # SL被弾率60%超で注意
 SDM_API_FAIL_RATE_CAUTION = 0.20   # API失敗率20%超で注意
 # WARNING閾値（リスク自動半減トリガー）
 SDM_WIN_RATE_WARNING = 0.25        # 勝率25%未満で警告
 SDM_CONSECUTIVE_LOSS_WARNING = 5   # 5連敗で警告
-SDM_CONSECUTIVE_WAIT_WARNING = 15  # 連続WAIT 15回で警告
 SDM_SL_HIT_RATE_WARNING = 0.75     # SL被弾率75%超で警告
 SDM_API_FAIL_RATE_WARNING = 0.40   # API失敗率40%超で警告
 # CRITICAL閾値（新規エントリー一時停止トリガー）
@@ -146,6 +144,7 @@ SDM_WIN_RATE_CRITICAL = 0.15       # 勝率15%未満で危機
 SDM_CONSECUTIVE_LOSS_CRITICAL = 7  # 7連敗で危機
 SDM_AVG_LOSS_WIN_RATIO_CRITICAL = 3.0  # 平均損失が平均利益の3倍超で危機
 SDM_CRITICAL_PAUSE_SECONDS = 3600  # 危機時の一時停止時間 (1時間)
+SDM_CRITICAL_MIN_TRADES = 10       # CRITICAL判定に必要な最低トレード数
 
 
 # ============================================================================
@@ -680,6 +679,14 @@ class SelfDestructionMonitor:
 
         new_level, alerts = self._determine_level(metrics)
 
+        # ★G-M1修正: タイマー稼働中は成績が改善してもCRITICAL維持。
+        # 理由: is_entry_pausedがTrueなのにcurrent_levelがNORMALだと
+        #        get_dynamic_riskとentry_pausedがねじれる。
+        if self.is_entry_paused and new_level != self.CRITICAL:
+            new_level = self.CRITICAL
+            if not alerts:
+                alerts.append("CRITICAL維持中（一時停止タイマー稼働中）")
+
         # CRITICAL発動: 一時停止タイマーセット（既に停止中なら延長しない）
         if new_level == self.CRITICAL and not self.is_entry_paused:
             self._critical_pause_until = now + SDM_CRITICAL_PAUSE_SECONDS
@@ -756,31 +763,26 @@ class SelfDestructionMonitor:
         if avg_win > 0:
             result["avg_loss_win_ratio"] = round(avg_loss / avg_win, 2)
         else:
-            # 勝ちトレードがゼロなら比率は無限大相当 → 高い値をセット
-            result["avg_loss_win_ratio"] = 99.0 if loss_pips else None
+            # ★G-M2修正: 勝ちが0件なら比率判定不能。Noneのまま残す。
+            # 旧: 99.0を代入→5件全敗で即CRITICAL化するバグがあった。
+            # 連敗数の判定（consecutive_losses）に委ねる。
+            result["avg_loss_win_ratio"] = None
 
         return result
 
     def _analyze_councils(self, councils: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """直近合議ログからSDM指標を算出"""
+        """直近合議ログからSDM指標を算出（API失敗率のみ）"""
         result = {
             "council_count": len(councils),
-            "consecutive_waits": 0,
             "api_fail_rate": None,
         }
         if not councils:
             return result
 
-        # 連続WAIT数: 先頭（最新）から連続するWAITの数
-        consec_wait = 0
-        for c in councils:
-            if c.get("action", "").upper() == "WAIT":
-                consec_wait += 1
-            else:
-                break
-        result["consecutive_waits"] = consec_wait
-
-        # API失敗率: reasonに"API"を含むWAITの割合
+        # API失敗率: reasonに"APIエラー"を含むWAITの割合
+        # ★G-m1修正: 連続WAIT監視は削除。
+        #   理由: 状態CのKEEPもWAITで記録されるため、正常な利益追求を誤検知する。
+        #   WAITが多いのは「相場不適」であり「BOT故障」ではない。DD4層が管轄。
         api_fails = 0
         for c in councils:
             action = c.get("action", "").upper()
@@ -803,7 +805,9 @@ class SelfDestructionMonitor:
         council_count = metrics.get("council_count", 0)
 
         # --- CRITICAL判定（最も深刻）---
-        if trade_count >= 5:
+        # ★P-M1修正: CRITICAL判定は母数をCAUTION/WARNINGと分離。
+        # 5件程度の少数不運でCRITICAL化するのを防ぐ。
+        if trade_count >= SDM_CRITICAL_MIN_TRADES:
             wr = metrics.get("win_rate")
             if wr is not None and wr < SDM_WIN_RATE_CRITICAL:
                 alerts.append(f"勝率{wr:.0%} < {SDM_WIN_RATE_CRITICAL:.0%}")
@@ -838,11 +842,6 @@ class SelfDestructionMonitor:
                     max_level = max(max_level, self.WARNING, key=lambda l: self._LEVEL_WEIGHT[l])
 
             if council_count >= 5:
-                cw = metrics.get("consecutive_waits", 0)
-                if cw >= SDM_CONSECUTIVE_WAIT_WARNING:
-                    alerts.append(f"連続WAIT {cw}回 >= {SDM_CONSECUTIVE_WAIT_WARNING}")
-                    max_level = max(max_level, self.WARNING, key=lambda l: self._LEVEL_WEIGHT[l])
-
                 afr = metrics.get("api_fail_rate")
                 if afr is not None and afr > SDM_API_FAIL_RATE_WARNING:
                     alerts.append(f"API失敗率{afr:.0%} > {SDM_API_FAIL_RATE_WARNING:.0%}")
@@ -867,11 +866,6 @@ class SelfDestructionMonitor:
                     max_level = max(max_level, self.CAUTION, key=lambda l: self._LEVEL_WEIGHT[l])
 
             if council_count >= 5:
-                cw = metrics.get("consecutive_waits", 0)
-                if cw >= SDM_CONSECUTIVE_WAIT_CAUTION:
-                    alerts.append(f"連続WAIT {cw}回 >= {SDM_CONSECUTIVE_WAIT_CAUTION}")
-                    max_level = max(max_level, self.CAUTION, key=lambda l: self._LEVEL_WEIGHT[l])
-
                 afr = metrics.get("api_fail_rate")
                 if afr is not None and afr > SDM_API_FAIL_RATE_CAUTION:
                     alerts.append(f"API失敗率{afr:.0%} > {SDM_API_FAIL_RATE_CAUTION:.0%}")
@@ -2034,7 +2028,7 @@ def ask_gemini_council(market_json: str, ref_images: List[PIL.Image.Image],
                        chart_images: List[PIL.Image.Image]) -> str:
     """Gemini合議を実行"""
     if gemini_client is None:
-        return '{"action":"WAIT","sl":0,"reason":"未初期化","council_a":"","council_b":"","council_c":"","council_d":""}'
+        return '{"action":"WAIT","sl":0,"tp":0,"reason":"未初期化","council_a":"","council_b":"","council_c":"","council_d":""}'
 
     charter = load_execution_charter()
     prompt = (
@@ -2073,7 +2067,7 @@ def ask_gemini_council(market_json: str, ref_images: List[PIL.Image.Image],
             logging.warning(f"Gemini API リトライ({attempt+1}): {e} (待機{wait}秒)")
             time.sleep(wait)
 
-    return '{"action":"WAIT","sl":0,"reason":"APIエラー","council_a":"","council_b":"","council_c":"","council_d":""}'
+    return '{"action":"WAIT","sl":0,"tp":0,"reason":"APIエラー","council_a":"","council_b":"","council_c":"","council_d":""}'
 
 
 def parse_decision(decision: str) -> Tuple[str, float, float]:
