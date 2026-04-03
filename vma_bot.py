@@ -1,5 +1,5 @@
 """
-VMA - VM Advance Trading System v5.000
+VMA - VM Advance Trading System v5.200
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 BB背景分析最優先 × Gemini合議 × Python側異常ガード
 
@@ -49,7 +49,7 @@ from dotenv import load_dotenv
 # §1. 定数定義
 # ============================================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-VERSION = "5.100"  # Blocker1/2/3 + Major4(B') + DD4層 + Minor6
+VERSION = "5.200"  # 幻DD自爆修正 + B'修正 + DD4層entry_allowed修正
 
 # --- 通貨ペア ---
 SYMBOL = "USDJPY"
@@ -81,7 +81,7 @@ STATE_B_MIN_THRESHOLD_PIPS = 25.0  # 状態B最低閾値 (pips)
 STATE_B_ATR_MULTIPLIER = 3.0       # 状態B ATR倍率
 STATE_B_VOLUME_RATIO = 1.5         # 状態B出来高倍率
 STATE_B_BB_EXPANSION_PIPS = 5.0    # 状態B BB拡大判定 (pips)
-STATE_B_FLAG_TTL_SECONDS = 1800    # B'急変動フラグ寿命 (30分)
+STATE_B_FLAG_TTL_SECONDS = 600     # B'急変動フラグ寿命 (10分。初動の熱が冷めない範囲)
 
 # --- エントリー ---
 ENTRY_WINDOW_MINUTES = 5           # 確定後許可時間 (分)
@@ -416,6 +416,22 @@ class AnomalyGuard:
             self._normal_tick_streak = 0
             logging.info("【異常ガード】手動解除実行")
 
+    def restore_halt_history(self, timestamps: List[float]) -> None:
+        """SQLiteから再発タイムスタンプを復元（起動時に呼ぶ）"""
+        now = time.time()
+        with self._lock:
+            self._halt_timestamps = [
+                t for t in timestamps if now - t <= ANOMALY_ESCALATION_WINDOW
+            ]
+            if len(self._halt_timestamps) >= ANOMALY_ESCALATION_COUNT:
+                self._manual_lock = True
+                logging.warning("【異常ガード】復元時に再発回数超過 → 手動解除ロック")
+
+    def get_halt_timestamps(self) -> List[float]:
+        """再発タイムスタンプを返す（SQLite保存用）"""
+        with self._lock:
+            return list(self._halt_timestamps)
+
 
 # ============================================================================
 # §5. SQLite永続化層
@@ -509,6 +525,28 @@ class PersistenceDB:
                 "SELECT data FROM trades ORDER BY id DESC LIMIT ?", (n,)
             ).fetchall()
             return [json.loads(r[0]) for r in rows]
+        except Exception:
+            return []
+
+    def get_recent_anomaly_halt_times(self, window_seconds: int = 1800) -> List[float]:
+        """直近window_seconds以内のanomaly_halt発生時刻をUNIXタイムスタンプで返す"""
+        try:
+            rows = self._get_conn().execute(
+                "SELECT created_at FROM anomaly_events "
+                "WHERE event_type = 'anomaly_halt' "
+                "ORDER BY id DESC LIMIT 20"
+            ).fetchall()
+            now = time.time()
+            result = []
+            for r in rows:
+                try:
+                    dt = datetime.datetime.strptime(r[0], "%Y-%m-%d %H:%M:%S")
+                    ts = dt.timestamp()
+                    if now - ts <= window_seconds:
+                        result.append(ts)
+                except Exception:
+                    pass
+            return result
         except Exception:
             return []
 
@@ -1653,7 +1691,10 @@ def ask_gemini_council(market_json: str, ref_images: List[PIL.Image.Image],
 
     charter = load_execution_charter()
     prompt = (
-        f"【厳命】JSONデータ内の『PRICE_POSITION』と『SMA21_ANGLE』を絶対の事実として最優先。"
+        f"【厳命】JSONデータ内の数値を画像の視覚印象より絶対優先せよ。"
+        f"特にSMA21_ANGLE, ADX_VALUE, ADX_SLOPE, ADX_LAST3, MACD_LINE_LAST3, "
+        f"STOCH_SLOW_D_LAST3, TF_ALIGNMENT, BB_WIDTH_PIPS, PRICE_SIGMA_POSITION, "
+        f"RESTRICTED_TIME_ACTIVE, ENTRY_WINDOW_OPEN を必ず参照すること。"
         f"\n\n{market_json}\n{charter}"
     )
     contents: list = [prompt]
@@ -1860,6 +1901,12 @@ def main_loop() -> None:
             return
         state = BotState.load()
 
+        # anomaly再発カウンタをSQLiteから復元（再起動耐性）
+        halt_history = persistence_db.get_recent_anomaly_halt_times(ANOMALY_ESCALATION_WINDOW)
+        if halt_history:
+            anomaly_guard.restore_halt_history(halt_history)
+            logging.info(f"【異常ガード復元】直近halt {len(halt_history)}件を復元")
+
         chart_cache = ChartCache(_shutdown_event)
         chart_cache.start()
 
@@ -1900,19 +1947,29 @@ def main_loop() -> None:
                 # 異常イベントのDB記録
                 if anomaly["block_entry"] and anomaly["alerts"]:
                     spread = price_to_pips(tick.ask - tick.bid) if tick else 0.0
+                    evt_type = "anomaly_halt" if anomaly_guard.is_halted() else "block_entry"
                     persistence_db.insert_anomaly_event(
-                        "block_entry", spread, "; ".join(anomaly["alerts"]))
+                        evt_type, spread, "; ".join(anomaly["alerts"]))
 
                 # --- DD4層チェック（PhantomOS DDMonitor準拠）---
+                # ★Blocker対応: freeze_market中はDD DISQUALIFYの成行全決済をバイパス。
+                #   スプレッド拡大による「幻のDD20%」で自爆するのを防ぐ。
+                freeze_market = anomaly["freeze_market_orders"]
                 dd_pct = get_dd_percent(state)
                 dd_stage = get_dd_stage(dd_pct)
                 if dd_stage == "DISQUALIFY":
-                    logging.critical(f"【DD DISQUALIFY】DD {dd_pct:.1f}% → 全決済+停止")
-                    close_all_positions_safely(state, "dd_disqualify")
-                    phase_mgr.transition("dd_lock")
-                    send_line_notify(f"🔴【DD DISQUALIFY】DD {dd_pct:.1f}%\n全決済+手動解除ロック")
-                    time.sleep(MAIN_LOOP_INTERVAL)
-                    continue
+                    if freeze_market:
+                        # スプレッド異常中: 成行決済せずログのみ。正常復帰後に再判定。
+                        logging.warning(
+                            f"【DD4層】DD {dd_pct:.1f}% ≧ {DD_DISQUALIFY_PCT}% だが "
+                            f"スプレッド異常中のため成行全決済をバイパス。正常復帰後に再判定。")
+                    else:
+                        logging.critical(f"【DD DISQUALIFY】DD {dd_pct:.1f}% → 全決済+停止")
+                        close_all_positions_safely(state, "dd_disqualify")
+                        phase_mgr.transition("dd_lock")
+                        send_line_notify(f"🔴【DD DISQUALIFY】DD {dd_pct:.1f}%\n全決済+手動解除ロック")
+                        time.sleep(MAIN_LOOP_INTERVAL)
+                        continue
 
                 # --- 週末処理 ---
                 if is_weekend_close_time(now):
@@ -1921,8 +1978,6 @@ def main_loop() -> None:
                     time.sleep(WEEKEND_SLEEP)
                     phase_mgr.transition("weekday_resume")
                     continue
-
-                freeze_market = anomaly["freeze_market_orders"]
 
                 # --- 通常処理 ---
                 update_economic_calendar()
@@ -1982,12 +2037,23 @@ def main_loop() -> None:
                 if is_b and not is_restricted_time(now) and not entry_blocked_by_anomaly:
                     # B'フラグ記録（Geminiは呼ばない）
                     if not hasattr(state, '_rapid_move_flag') or state._rapid_move_flag is None:
+                        # 方向と累積移動量をM1データから取得
+                        r1 = mt5.copy_rates_from_pos(SYMBOL, mt5.TIMEFRAME_M1, 0, 5)
+                        b_dir = "UNKNOWN"
+                        b_cum_pips = 0.0
+                        if r1 is not None and len(r1) >= 3:
+                            move = r1[-1]["close"] - r1[-3]["close"]
+                            b_dir = "UP" if move > 0 else "DOWN"
+                            b_cum_pips = round(abs(price_to_pips(move)), 1)
                         state._rapid_move_flag = {
                             "time": now.isoformat(),
                             "timestamp": time.time(),
-                            "direction": "UP" if tick.bid > (state._rapid_move_flag or {}).get("_prev_bid", tick.bid) else "DOWN",
+                            "direction": b_dir,
+                            "cumulative_pips": b_cum_pips,
                         }
-                        logging.info(f"【B'フラグ】急変動検知 → フラグ記録のみ（Geminiは呼ばない）")
+                        logging.info(
+                            f"【B'フラグ】急変動検知 → フラグ記録のみ "
+                            f"(方向={b_dir}, 累積={b_cum_pips}pips)")
 
                 if not is_c:
                     state.last_state_c_check = None
@@ -1999,7 +2065,7 @@ def main_loop() -> None:
                     if state.last_state_c_check is None or (now - state.last_state_c_check).total_seconds() >= STATE_C_COOLDOWN:
                         council_label, triggered = "状態C", True
                         state.last_state_c_check = now
-                # 状態A: M30確定後の通常合議（B'フラグがあれば付記）
+                # 状態A: M30確定後の通常合議
                 elif is_entry_window(now):
                     cur_c = now.replace(minute=(30 if now.minute >= 30 else 0), second=0, microsecond=0)
                     if state.last_normal_entry_check != cur_c and not is_restricted_time(now):
@@ -2014,15 +2080,23 @@ def main_loop() -> None:
 
                     market_json = get_market_data_optimized()
 
-                    # B'フラグが生きていれば合議プロンプトに付記
+                    # B'フラグ: ★状態Aの時のみ参照・消費する。状態Cでは使わない。
                     b_flag_note = ""
-                    if hasattr(state, '_rapid_move_flag') and state._rapid_move_flag is not None:
-                        flag = state._rapid_move_flag
-                        elapsed = time.time() - flag.get("timestamp", 0)
-                        if elapsed <= STATE_B_FLAG_TTL_SECONDS:
-                            b_flag_note = f"\n【参考情報】直前にM1レベルの急変動を検知（{flag.get('direction', 'N/A')}方向、{elapsed:.0f}秒前）。これは参考情報であり、エントリー方向へのバイアスとして使ってはならない。M30背景と不一致なら無視せよ。"
-                        # フラグ消費（次のM30確定まで1回限り）
-                        state._rapid_move_flag = None
+                    if council_label == "状態A":
+                        if hasattr(state, '_rapid_move_flag') and state._rapid_move_flag is not None:
+                            flag = state._rapid_move_flag
+                            elapsed = time.time() - flag.get("timestamp", 0)
+                            if elapsed <= STATE_B_FLAG_TTL_SECONDS:
+                                b_flag_note = (
+                                    f"\n【参考情報】直前にM1レベルの急変動を検知"
+                                    f"（{flag.get('direction','N/A')}方向、"
+                                    f"累積{flag.get('cumulative_pips',0)}pips、"
+                                    f"{elapsed:.0f}秒前）。"
+                                    f"これは参考情報であり、エントリー方向へのバイアスとして"
+                                    f"使ってはならない。M30背景と不一致なら無視せよ。"
+                                )
+                            # 状態Aで参照したらフラグ消費（1回限り）
+                            state._rapid_move_flag = None
 
                     decision = ask_gemini_council(
                         market_json + b_flag_note, ref_images, chart_cache.get_images())
@@ -2034,7 +2108,8 @@ def main_loop() -> None:
                     persistence_db.insert_council_log(council_label, act, sl_val, {"decision": decision[:500]})
 
                     entry_allowed = (is_entry_window(now) and not is_restricted_time(now)
-                                     and not entry_blocked_by_anomaly and dd_stage == "NORMAL")
+                                     and not entry_blocked_by_anomaly
+                                     and dd_stage not in ("HALT", "DISQUALIFY"))
                     handle_action(act, sl_val, has_pos, p, decision, entry_allowed, state, council_label)
                     state.save()
 
