@@ -1,5 +1,5 @@
 """
-VMA - VM Advance Trading System v5.400
+VMA - VM Advance Trading System v5.500
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 BB背景分析最優先 × Gemini合議 × Python側異常ガード
 
@@ -11,6 +11,7 @@ Architecture:
   - タイムストップ（撤退の美学）
   - SQLite + JSONL二重永続化
   - LINE通知
+  - §21 SelfDestructionMonitor: 自壊前兆3段階検知(CAUTION/WARNING/CRITICAL)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
@@ -49,7 +50,7 @@ from dotenv import load_dotenv
 # §1. 定数定義
 # ============================================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-VERSION = "5.401"  # G7修正: TP必須+方向チェック+RR完全閉鎖
+VERSION = "5.500"  # §21 SelfDestructionMonitor追加
 
 # --- 通貨ペア ---
 SYMBOL = "USDJPY"
@@ -123,6 +124,28 @@ REFERENCE_IMAGE_PATHS = [
     os.path.join(BASE_DIR, "image_chop.png"),
     os.path.join(BASE_DIR, "image_expansion_convergence.png"),
 ]
+
+# --- §21 自壊前兆監視（SelfDestructionMonitor）---
+SDM_TRADE_WINDOW = 20              # ローリング集計対象トレード数
+SDM_COUNCIL_WINDOW = 30            # ローリング集計対象合議数
+SDM_CHECK_INTERVAL_SECONDS = 300   # 定期チェック間隔 (5分)
+# CAUTION閾値
+SDM_WIN_RATE_CAUTION = 0.35        # 勝率35%未満で注意
+SDM_CONSECUTIVE_LOSS_CAUTION = 3   # 3連敗で注意
+SDM_CONSECUTIVE_WAIT_CAUTION = 8   # 連続WAIT 8回で注意
+SDM_SL_HIT_RATE_CAUTION = 0.60     # SL被弾率60%超で注意
+SDM_API_FAIL_RATE_CAUTION = 0.20   # API失敗率20%超で注意
+# WARNING閾値（リスク自動半減トリガー）
+SDM_WIN_RATE_WARNING = 0.25        # 勝率25%未満で警告
+SDM_CONSECUTIVE_LOSS_WARNING = 5   # 5連敗で警告
+SDM_CONSECUTIVE_WAIT_WARNING = 15  # 連続WAIT 15回で警告
+SDM_SL_HIT_RATE_WARNING = 0.75     # SL被弾率75%超で警告
+SDM_API_FAIL_RATE_WARNING = 0.40   # API失敗率40%超で警告
+# CRITICAL閾値（新規エントリー一時停止トリガー）
+SDM_WIN_RATE_CRITICAL = 0.15       # 勝率15%未満で危機
+SDM_CONSECUTIVE_LOSS_CRITICAL = 7  # 7連敗で危機
+SDM_AVG_LOSS_WIN_RATIO_CRITICAL = 3.0  # 平均損失が平均利益の3倍超で危機
+SDM_CRITICAL_PAUSE_SECONDS = 3600  # 危機時の一時停止時間 (1時間)
 
 
 # ============================================================================
@@ -554,7 +577,310 @@ class PersistenceDB:
             return []
 
 
+    def get_recent_council_logs(self, n: int = 30) -> List[Dict[str, Any]]:
+        """直近n件の合議ログを取得（新しい順）"""
+        try:
+            rows = self._get_conn().execute(
+                "SELECT label, action, data, created_at FROM council_logs ORDER BY id DESC LIMIT ?", (n,)
+            ).fetchall()
+            results = []
+            for r in rows:
+                entry = {"label": r[0], "action": r[1], "created_at": r[3]}
+                try:
+                    entry["data"] = json.loads(r[2]) if r[2] else {}
+                except Exception:
+                    entry["data"] = {}
+                results.append(entry)
+            return results
+        except Exception:
+            return []
+
+
 persistence_db = PersistenceDB()
+
+
+# ============================================================================
+# §21. 自壊前兆監視（SelfDestructionMonitor）
+# ============================================================================
+# 目的: BOTが「自分で自分を壊す」前兆を検知し、自動的にブレーキをかける。
+# 具体例: Geminiが間違った判断を連発 / APIが不安定 / SL連続被弾 / 全部WAIT病
+#
+# 3段階エスカレーション:
+#   NORMAL  → 異常なし
+#   CAUTION → LINE通知のみ（人間に気づかせる）
+#   WARNING → リスク自動半減（get_dynamic_riskが参照する）
+#   CRITICAL→ 新規エントリー一時停止（SDM_CRITICAL_PAUSE_SECONDS）
+#
+# データソース: SQLiteのtradesテーブル + council_logsテーブル
+# 呼び出し頻度: SDM_CHECK_INTERVAL_SECONDS（5分）ごと
+# ============================================================================
+class SelfDestructionMonitor:
+    """自壊前兆の検知と段階的ブレーキ"""
+
+    # レベル定数（文字列比較で使用）
+    NORMAL = "NORMAL"
+    CAUTION = "CAUTION"
+    WARNING = "WARNING"
+    CRITICAL = "CRITICAL"
+
+    # レベルの重み（エスカレーション比較用）
+    _LEVEL_WEIGHT = {NORMAL: 0, CAUTION: 1, WARNING: 2, CRITICAL: 3}
+
+    def __init__(self):
+        self._last_check_time: float = 0.0
+        self._current_level: str = self.NORMAL
+        self._critical_pause_until: float = 0.0  # UNIX timestamp
+        self._last_notified_level: str = self.NORMAL  # 重複通知防止
+
+    @property
+    def current_level(self) -> str:
+        return self._current_level
+
+    @property
+    def is_entry_paused(self) -> bool:
+        """CRITICALによるエントリー一時停止中か"""
+        return time.time() < self._critical_pause_until
+
+    @property
+    def pause_remaining_seconds(self) -> float:
+        """一時停止の残り秒数（0以下なら停止中でない）"""
+        return max(0.0, self._critical_pause_until - time.time())
+
+    def restore_pause(self, pause_until: float) -> None:
+        """再起動時にBotStateからpause_untilを復元"""
+        if pause_until > time.time():
+            self._critical_pause_until = pause_until
+            self._current_level = self.CRITICAL
+            logging.info(
+                f"【SDM復元】CRITICAL一時停止を復元 "
+                f"(残り{self.pause_remaining_seconds:.0f}秒)")
+
+    def check(self) -> Dict[str, Any]:
+        """定期チェック。呼び出し元はSDM_CHECK_INTERVAL_SECONDSごとに呼ぶ。
+
+        Returns:
+            level: NORMAL/CAUTION/WARNING/CRITICAL
+            alerts: 検知した前兆のリスト（LINE通知用）
+            risk_multiplier: get_dynamic_riskに適用する乗数（1.0/0.5/0.0）
+            entry_paused: エントリー停止中か
+            pause_remaining: 停止残り秒数
+            metrics: 算出した指標（ログ用）
+        """
+        now = time.time()
+
+        # 一時停止中でもチェックは行う（回復判定のため）
+        # ただし一時停止は時間経過でのみ解除（自然解除）
+
+        trades = persistence_db.get_recent_trades(SDM_TRADE_WINDOW)
+        councils = persistence_db.get_recent_council_logs(SDM_COUNCIL_WINDOW)
+
+        trade_metrics = self._analyze_trades(trades)
+        council_metrics = self._analyze_councils(councils)
+        metrics = {**trade_metrics, **council_metrics}
+
+        new_level, alerts = self._determine_level(metrics)
+
+        # CRITICAL発動: 一時停止タイマーセット（既に停止中なら延長しない）
+        if new_level == self.CRITICAL and not self.is_entry_paused:
+            self._critical_pause_until = now + SDM_CRITICAL_PAUSE_SECONDS
+            alerts.append(
+                f"🔴 CRITICAL: エントリーを{SDM_CRITICAL_PAUSE_SECONDS // 60}分間停止")
+
+        self._current_level = new_level
+        self._last_check_time = now
+
+        # LINE通知: レベルが上昇した場合のみ（同レベル連続通知はしない）
+        should_notify = (
+            self._LEVEL_WEIGHT.get(new_level, 0)
+            > self._LEVEL_WEIGHT.get(self._last_notified_level, 0)
+        )
+        if should_notify and new_level != self.NORMAL:
+            self._last_notified_level = new_level
+
+        # NORMALに戻ったら通知レベルをリセット
+        if new_level == self.NORMAL:
+            self._last_notified_level = self.NORMAL
+
+        # リスク乗数: WARNING→半減、CRITICAL→ゼロ（entry_pausedで判定）
+        if new_level == self.CRITICAL:
+            risk_multiplier = 0.0
+        elif new_level == self.WARNING:
+            risk_multiplier = 0.5
+        else:
+            risk_multiplier = 1.0
+
+        return {
+            "level": new_level,
+            "alerts": alerts,
+            "should_notify": should_notify and new_level != self.NORMAL,
+            "risk_multiplier": risk_multiplier,
+            "entry_paused": self.is_entry_paused,
+            "pause_remaining": self.pause_remaining_seconds,
+            "metrics": metrics,
+        }
+
+    def _analyze_trades(self, trades: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """直近トレードからSDM指標を算出"""
+        result = {
+            "trade_count": len(trades),
+            "win_rate": None,
+            "consecutive_losses": 0,
+            "sl_hit_rate": None,
+            "avg_loss_win_ratio": None,
+        }
+        if not trades:
+            return result
+
+        wins = [t for t in trades if t.get("win", False)]
+        losses = [t for t in trades if not t.get("win", True)]
+        result["win_rate"] = len(wins) / len(trades) if trades else None
+
+        # 連敗数: 先頭（最新）から連続する負けの数
+        consec = 0
+        for t in trades:
+            if not t.get("win", True):
+                consec += 1
+            else:
+                break
+        result["consecutive_losses"] = consec
+
+        # SL被弾率
+        sl_hits = sum(1 for t in trades if t.get("exit_reason") == "sl")
+        result["sl_hit_rate"] = sl_hits / len(trades) if trades else None
+
+        # 平均損失 / 平均利益 比率
+        win_pips = [abs(t.get("result_pips", 0)) for t in wins if t.get("result_pips", 0) > 0]
+        loss_pips = [abs(t.get("result_pips", 0)) for t in losses if t.get("result_pips", 0) < 0]
+        avg_win = sum(win_pips) / len(win_pips) if win_pips else 0.0
+        avg_loss = sum(loss_pips) / len(loss_pips) if loss_pips else 0.0
+        if avg_win > 0:
+            result["avg_loss_win_ratio"] = round(avg_loss / avg_win, 2)
+        else:
+            # 勝ちトレードがゼロなら比率は無限大相当 → 高い値をセット
+            result["avg_loss_win_ratio"] = 99.0 if loss_pips else None
+
+        return result
+
+    def _analyze_councils(self, councils: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """直近合議ログからSDM指標を算出"""
+        result = {
+            "council_count": len(councils),
+            "consecutive_waits": 0,
+            "api_fail_rate": None,
+        }
+        if not councils:
+            return result
+
+        # 連続WAIT数: 先頭（最新）から連続するWAITの数
+        consec_wait = 0
+        for c in councils:
+            if c.get("action", "").upper() == "WAIT":
+                consec_wait += 1
+            else:
+                break
+        result["consecutive_waits"] = consec_wait
+
+        # API失敗率: reasonに"API"を含むWAITの割合
+        api_fails = 0
+        for c in councils:
+            action = c.get("action", "").upper()
+            data = c.get("data", {})
+            decision_text = ""
+            if isinstance(data, dict):
+                decision_text = str(data.get("decision", ""))
+            if action == "WAIT" and "APIエラー" in decision_text:
+                api_fails += 1
+        result["api_fail_rate"] = api_fails / len(councils) if councils else None
+
+        return result
+
+    def _determine_level(self, metrics: Dict[str, Any]) -> Tuple[str, List[str]]:
+        """指標から最も深刻なレベルを判定"""
+        alerts: List[str] = []
+        max_level = self.NORMAL
+
+        trade_count = metrics.get("trade_count", 0)
+        council_count = metrics.get("council_count", 0)
+
+        # --- CRITICAL判定（最も深刻）---
+        if trade_count >= 5:
+            wr = metrics.get("win_rate")
+            if wr is not None and wr < SDM_WIN_RATE_CRITICAL:
+                alerts.append(f"勝率{wr:.0%} < {SDM_WIN_RATE_CRITICAL:.0%}")
+                max_level = self.CRITICAL
+
+            cl = metrics.get("consecutive_losses", 0)
+            if cl >= SDM_CONSECUTIVE_LOSS_CRITICAL:
+                alerts.append(f"{cl}連敗 >= {SDM_CONSECUTIVE_LOSS_CRITICAL}")
+                max_level = self.CRITICAL
+
+            alwr = metrics.get("avg_loss_win_ratio")
+            if alwr is not None and alwr >= SDM_AVG_LOSS_WIN_RATIO_CRITICAL:
+                alerts.append(f"損益比{alwr:.1f} >= {SDM_AVG_LOSS_WIN_RATIO_CRITICAL:.1f}")
+                max_level = self.CRITICAL
+
+        # --- WARNING判定 ---
+        if max_level != self.CRITICAL:
+            if trade_count >= 5:
+                wr = metrics.get("win_rate")
+                if wr is not None and wr < SDM_WIN_RATE_WARNING:
+                    alerts.append(f"勝率{wr:.0%} < {SDM_WIN_RATE_WARNING:.0%}")
+                    max_level = max(max_level, self.WARNING, key=lambda l: self._LEVEL_WEIGHT[l])
+
+                cl = metrics.get("consecutive_losses", 0)
+                if cl >= SDM_CONSECUTIVE_LOSS_WARNING:
+                    alerts.append(f"{cl}連敗 >= {SDM_CONSECUTIVE_LOSS_WARNING}")
+                    max_level = max(max_level, self.WARNING, key=lambda l: self._LEVEL_WEIGHT[l])
+
+                shr = metrics.get("sl_hit_rate")
+                if shr is not None and shr > SDM_SL_HIT_RATE_WARNING:
+                    alerts.append(f"SL被弾率{shr:.0%} > {SDM_SL_HIT_RATE_WARNING:.0%}")
+                    max_level = max(max_level, self.WARNING, key=lambda l: self._LEVEL_WEIGHT[l])
+
+            if council_count >= 5:
+                cw = metrics.get("consecutive_waits", 0)
+                if cw >= SDM_CONSECUTIVE_WAIT_WARNING:
+                    alerts.append(f"連続WAIT {cw}回 >= {SDM_CONSECUTIVE_WAIT_WARNING}")
+                    max_level = max(max_level, self.WARNING, key=lambda l: self._LEVEL_WEIGHT[l])
+
+                afr = metrics.get("api_fail_rate")
+                if afr is not None and afr > SDM_API_FAIL_RATE_WARNING:
+                    alerts.append(f"API失敗率{afr:.0%} > {SDM_API_FAIL_RATE_WARNING:.0%}")
+                    max_level = max(max_level, self.WARNING, key=lambda l: self._LEVEL_WEIGHT[l])
+
+        # --- CAUTION判定 ---
+        if max_level == self.NORMAL:
+            if trade_count >= 5:
+                wr = metrics.get("win_rate")
+                if wr is not None and wr < SDM_WIN_RATE_CAUTION:
+                    alerts.append(f"勝率{wr:.0%} < {SDM_WIN_RATE_CAUTION:.0%}")
+                    max_level = self.CAUTION
+
+                cl = metrics.get("consecutive_losses", 0)
+                if cl >= SDM_CONSECUTIVE_LOSS_CAUTION:
+                    alerts.append(f"{cl}連敗 >= {SDM_CONSECUTIVE_LOSS_CAUTION}")
+                    max_level = max(max_level, self.CAUTION, key=lambda l: self._LEVEL_WEIGHT[l])
+
+                shr = metrics.get("sl_hit_rate")
+                if shr is not None and shr > SDM_SL_HIT_RATE_CAUTION:
+                    alerts.append(f"SL被弾率{shr:.0%} > {SDM_SL_HIT_RATE_CAUTION:.0%}")
+                    max_level = max(max_level, self.CAUTION, key=lambda l: self._LEVEL_WEIGHT[l])
+
+            if council_count >= 5:
+                cw = metrics.get("consecutive_waits", 0)
+                if cw >= SDM_CONSECUTIVE_WAIT_CAUTION:
+                    alerts.append(f"連続WAIT {cw}回 >= {SDM_CONSECUTIVE_WAIT_CAUTION}")
+                    max_level = max(max_level, self.CAUTION, key=lambda l: self._LEVEL_WEIGHT[l])
+
+                afr = metrics.get("api_fail_rate")
+                if afr is not None and afr > SDM_API_FAIL_RATE_CAUTION:
+                    alerts.append(f"API失敗率{afr:.0%} > {SDM_API_FAIL_RATE_CAUTION:.0%}")
+                    max_level = max(max_level, self.CAUTION, key=lambda l: self._LEVEL_WEIGHT[l])
+
+        return max_level, alerts
+
+
+sdm_monitor = SelfDestructionMonitor()
 
 
 # ============================================================================
@@ -736,6 +1062,7 @@ class BotState:
     open_trades: Dict[int, TradeTracker] = field(default_factory=dict)
     consecutive_losses: int = 0
     peak_balance: float = 0.0
+    sdm_critical_pause_until: float = 0.0  # §21 SDM CRITICAL時の一時停止期限(UNIX ts)
     start_time: datetime.datetime = field(default_factory=datetime.datetime.now)
 
     def save(self) -> None:
@@ -747,6 +1074,7 @@ class BotState:
                 "open_trades": {str(k): v.to_dict() for k, v in self.open_trades.items()},
                 "consecutive_losses": self.consecutive_losses,
                 "peak_balance": self.peak_balance,
+                "sdm_critical_pause_until": self.sdm_critical_pause_until,
             }
             atomic_write_json(STATE_FILE, data)
         except Exception as e:
@@ -771,6 +1099,7 @@ class BotState:
                     pass
             state.consecutive_losses = data.get("consecutive_losses", 0)
             state.peak_balance = data.get("peak_balance", 0.0)
+            state.sdm_critical_pause_until = data.get("sdm_critical_pause_until", 0.0)
             logging.info("【復元】BotStateをファイルから復元しました。")
         except Exception as e:
             logging.warning(f"BotState復元失敗 (初期状態で開始): {e}")
@@ -1149,7 +1478,7 @@ def get_dd_stage(dd_pct: float) -> str:
 
 
 def get_dynamic_risk(state: BotState) -> float:
-    """DD4層+連敗から動的リスクを計算（PhantomOS DDMonitor準拠）"""
+    """DD4層+連敗+SDMから動的リスクを計算（PhantomOS DDMonitor準拠）"""
     acc = mt5.account_info()
     if not acc:
         return BASE_RISK_PERCENT
@@ -1168,20 +1497,34 @@ def get_dynamic_risk(state: BotState) -> float:
     elif stage == "HALT":
         logging.warning(f"【DD4層】DD {dd_pct:.1f}% ≧ {DD_HALT_PCT}% → 新規停止")
         return 0.0  # 新規エントリー不可
-    elif stage == "REDUCTION":
+
+    # DD + 連敗からベースリスクを決定
+    risk = BASE_RISK_PERCENT
+    if stage == "REDUCTION":
         logging.info(f"【DD4層】DD {dd_pct:.1f}% ≧ {DD_REDUCTION_PCT}% → リスク半減")
-        return BASE_RISK_PERCENT / 2.0
+        risk = BASE_RISK_PERCENT / 2.0
     elif stage == "WARNING":
         logging.info(f"【DD4層】DD {dd_pct:.1f}% ≧ {DD_WARNING_PCT}% → 警告")
 
     if state.consecutive_losses >= 5:
         logging.info(f"【資金防衛】{state.consecutive_losses}連敗 → リスク1/3")
-        return BASE_RISK_PERCENT / 3.0
+        risk = min(risk, BASE_RISK_PERCENT / 3.0)
     elif state.consecutive_losses >= 3:
         logging.info(f"【資金防衛】{state.consecutive_losses}連敗 → リスク半減")
-        return BASE_RISK_PERCENT / 2.0
+        risk = min(risk, BASE_RISK_PERCENT / 2.0)
 
-    return BASE_RISK_PERCENT
+    # §21 SDM: WARNING以上ならさらに半減（DD/連敗と複合適用）
+    sdm_level = sdm_monitor.current_level
+    if sdm_level == SelfDestructionMonitor.CRITICAL:
+        # CRITICALはmain_loopのentry_paused判定で止まるが、
+        # 万一ここに到達した場合もリスク0で二重防御
+        logging.warning("【SDM】CRITICAL → リスク0（エントリー停止中）")
+        return 0.0
+    elif sdm_level == SelfDestructionMonitor.WARNING:
+        logging.info("【SDM】WARNING → リスクさらに半減")
+        risk *= 0.5
+
+    return risk
 
 
 def calculate_dynamic_lot(sl_price: float, entry_price: float, state: BotState) -> Tuple[float, int]:
@@ -1999,6 +2342,12 @@ def main_loop() -> None:
             anomaly_guard.restore_halt_history(halt_history)
             logging.info(f"【異常ガード復元】直近halt {len(halt_history)}件を復元")
 
+        # §21 SDM: CRITICAL一時停止をBotStateから復元
+        if state.sdm_critical_pause_until > 0:
+            sdm_monitor.restore_pause(state.sdm_critical_pause_until)
+
+        sdm_last_check_time = 0.0  # SDM定期チェック用タイマー
+
         chart_cache = ChartCache(_shutdown_event)
         chart_cache.start()
 
@@ -2067,6 +2416,35 @@ def main_loop() -> None:
                         continue
 
                 # --- 週末処理 ---
+
+                # --- §21 SDM定期チェック（5分間隔）---
+                if time.time() - sdm_last_check_time >= SDM_CHECK_INTERVAL_SECONDS:
+                    sdm_result = sdm_monitor.check()
+                    sdm_last_check_time = time.time()
+
+                    if sdm_result["level"] != SelfDestructionMonitor.NORMAL:
+                        logging.warning(
+                            f"【SDM】レベル={sdm_result['level']} "
+                            f"指標={sdm_result['metrics']} "
+                            f"前兆={sdm_result['alerts']}")
+
+                    if sdm_result["should_notify"]:
+                        alert_text = "\n".join(sdm_result["alerts"])
+                        if sdm_result["level"] == SelfDestructionMonitor.CRITICAL:
+                            send_line_notify(
+                                f"🔴【自壊前兆 CRITICAL】\n{alert_text}\n"
+                                f"エントリーを{SDM_CRITICAL_PAUSE_SECONDS // 60}分間停止します")
+                        elif sdm_result["level"] == SelfDestructionMonitor.WARNING:
+                            send_line_notify(f"🟠【自壊前兆 WARNING】\n{alert_text}\nリスクを自動半減しました")
+                        else:
+                            send_line_notify(f"🟡【自壊前兆 CAUTION】\n{alert_text}")
+
+                    # CRITICAL一時停止のBotState永続化（再起動耐性）
+                    new_pause = sdm_monitor._critical_pause_until
+                    if new_pause != state.sdm_critical_pause_until:
+                        state.sdm_critical_pause_until = new_pause
+                        state.save()
+
                 if is_weekend_close_time(now):
                     close_all_positions_safely(state, "weekend_close")
                     phase_mgr.transition("weekend")
@@ -2204,7 +2582,8 @@ def main_loop() -> None:
 
                     entry_allowed = (is_entry_window(now) and not is_restricted_time(now)
                                      and not entry_blocked_by_anomaly
-                                     and dd_stage not in ("HALT", "DISQUALIFY"))
+                                     and dd_stage not in ("HALT", "DISQUALIFY")
+                                     and not sdm_monitor.is_entry_paused)
                     handle_action(act, sl_val, tp_val, has_pos, p, decision, entry_allowed, state, council_label, anomaly)
                     state.save()
 
