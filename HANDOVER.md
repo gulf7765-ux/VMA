@@ -7,112 +7,75 @@
 
 ### プロジェクト状態
 - プロジェクト名: VMA（VM Advance Trading System）
-- 現在バージョン: v5.100
-- 段階: Blocker/Major全件実装完了 → 再監査待ち
+- 現在バージョン: v5.401
+- 段階: **両監査官承認済み** → 次フェーズ（自壊前兆監視）へ移行
 - GitHub: https://github.com/gulf7765-ux/VMA
-- 最新SHA: （pushで確定）
+- 最新SHA: 26f678e749e956f0f6ba156a154ffb53cc71acca
 
-### v5.100で入った修正
-1. AnomalyGuard書き換え（Blocker1/2）: 緊急全決済撤廃、段階復帰、手動ロック
-2. ADX/MACD/ストキャス計算追加（Blocker3）: 数値+直近3本生値+傾き分類
-3. M15/D1追加、TF_ALIGNMENT追加
-4. DD 4層化（PhantomOS準拠）: WARNING/REDUCTION/HALT/DISQUALIFY
-5. 状態B → B'化: Gemini呼ばず急変動フラグのみ
-6. freeze_market_orders: スプレッド異常時は成行凍結、トレーリング維持
-7. ddof=1統一
-8. charter.md: H4/D1閾値追加、MACD記述強化
+### 監査結果
+- **GPT: 承認（Blocker 0 / Major 0）** Minor 2件のみ
+- **Gemini: 完全承認（Blocker 0 / Major 0）** v5.300から3回連続承認
+
+### GPT残Minor（次便で対応可）
+1. WAIT系フォールバックJSONにtp:0が未設定
+2. docstring先頭がv5.400のまま（VERSION定数は5.401）
 
 ### リポジトリ構成
-```
-VMA/
-  vma_bot.py        (1736行) メインBOT
-  supervisor.py     (120行)  プロセス監視
-  README.md                  プロジェクト概要
-  requirements.txt           依存パッケージ
-  .env.example               環境変数テンプレート
-  .gitignore                 除外設定
-  HANDOVER.md                本ファイル
-```
+- vma_bot.py (2219行) メインBOT
+- supervisor.py (120行) プロセス監視
+- charter.md Gemini実行憲章（TP追加済み）
+- HANDOVER.md 本ファイル
+- README.md / requirements.txt / .env.example / .gitignore
 
-### 未配置ファイル（次ステップで対応必要）
-- charter.md: Gemini実行憲章（これがないとGeminiがまともに判断できない）
-- image_head_fake.png / image_chop.png / image_expansion_convergence.png: 参照画像
-- analyzer.py: パフォーマンス分析（後日移植）
+### 実装済み安全装置（v5.401時点）
+1. AnomalyGuard: スプレッド/凍結/ジャンプ即時検知、段階復帰、手動ロック
+2. DD 4層: WARNING(8%)/REDUCTION(10%)/HALT(15%)/DISQUALIFY(20%)
+3. PostSignalGate G1-G7: SL方向/距離/リスク金額/スプレッド/重複/スクイーズ/RR比
+4. freeze_market_orders: 成行凍結（CLOSE含む）、トレーリング維持
+5. B'フラグ: 急変動メモ→状態Aのみ参照→バイアス禁止
+6. タイムストップ: 180分+1R未満→撤退
+7. 非線形R倍数トレーリング: 1R/2R/3R/4R段階制
+8. DD DISQUALIFYバイパス: spread_anomaly起因のみ
 
-### 監査官への提出状況
-- GPT: 方針承認済み、実装承認待ち。charter.md Blocker解除済み。
-- Gemini: 方針全件承認済み（Adopt）、実装確認待ち。
-- 主要論点: Blocker 1/2/3 + Major 4(B'案) 全件実装済み。
-- 残件:
-  - PostSignalGate（エントリー前関門）: 未実装。次の優先課題。
-  - analyzer.py: 未移植
-  - 自壊前兆監視: ライブ前に必要（GPT指摘）
+### 修正履歴
+v5.000→v5.100→v5.200→v5.300→v5.400→v5.401(承認)
 
-### 意図的除外項目（v4.003にあったが今回除外）
-- 攻撃モード（ATTACK_RISK）
-- UltimateRiskAnalyzer（Bootstrap信頼区間）
-- self_destruction_precursor_detector（自壊前兆検知）
-- ヘルスチェックHTTPサーバー
+### 次のステップ（両監査官同意済み）
+1. 自壊前兆監視
+2. analyzer.py移植
+3. VMA専用憲章整備
 
-### 技術的な注意事項
-- Geminiモデル名: gemini-2.5-pro-preview-05-06（利用可能性は要確認）
-- GitHub push: api.github.comがClaudeの環境からブロックされている。
-  リポジトリ作成はこうへいが手動で行う必要がある。pushはgithub.com経由で可能。
-- PATトークン: こうへいがスレッドごとに提供する。
+### 技術注意
+- Geminiモデル: gemini-2.5-pro-preview-05-06
+- api.github.comブロック。リポ作成はこうへい手動。
+- PATはスレッドごと提供。push後即除去。
 
 ---
 
 ## B. 監査官向けHandover
 
-### プロジェクト概要
-VMAはBB背景分析を絶対的第1条件とするFXデイトレード自動売買BOT。
-MT5 + Python + Gemini API構成。
-VMAメソッド（詳細版50章）に基づき、BB±3σ/±2σのレジーム分類を
-最優先にした売買判断を行う。
+### 承認済み: v5.401 (SHA: 26f678e)
+GPT/Gemini両監査官承認。Blocker 0 / Major 0。
 
-### 初回提出の概要
-- SHA: 91bb14667016153ca249164f2f4f91847f3d174a
-- 主要ファイル: vma_bot.py（1736行）、supervisor.py（120行）
-- ベース: vm_advance_final v4.003（レジーム改訂前）
-- 主な追加: AnomalyGuard（Python側即時異常検知）
-- 主な除外: 攻撃モード、Bootstrap分析、自壊前兆検知
+### 監査ラウンド履歴
+1. v5.000 → 差し戻し（Blocker4件）
+2. v5.100 → 方針承認
+3. v5.200 → Gemini承認、GPT差し戻し
+4. v5.300 → Gemini承認、GPT差し戻し
+5. v5.400 → Gemini承認、GPT差し戻し
+6. v5.401 → **両者承認**
 
-### 監査で提起した論点
-1. トリガー体系: 状態B（M1急変動検知）がVMAの
-   「M30確定ベース・フライング厳禁」と矛盾。A/B/C案を提示。
-2. AnomalyGuardの閾値妥当性（仮値）
-3. ANOMALY_HALTEDの自動復帰の安全性
-4. ADX/MACD/ストキャスをPython側で計算してGeminiに渡すべきか
-5. charter.md未配置問題
-
-### 監査官の最後の指摘
-- GPT: 「方針承認、実装未承認。項目名統一/M15・D1追加/レジサポ距離/spread異常時の任意決済凍結/anomaly再発カウンタ永続化/状態C役割説明修正を入れて再提出」
-- Gemini: 「概ね全件承認（Adopt）。charter.mdにH4=150pip/D1=350pip閾値追記、MACD記述強化、ADX計算式のMT5との一致確認を求める」
+### 監査官の最後の発言
+- GPT: 「承認。次は自壊前兆監視→analyzer→憲章」
+- Gemini: 「完全承認。次フェーズ着手を承認」
 
 ---
 
-## C. 運用ルール（全スレッド共通・必ず遵守）
+## C. 運用ルール
 
-### ユーザー（こうへい）への説明義務
-- **毎回、こうへいに向けて平易な日本語で説明を添えること。**
-- 監査官向けメッセージ（コードブロック）だけを出力して終わりにしない。
-- 専門用語には必ず一言補足する。
-- 何をやっていて、何が起きていて、次に何をすべきかを常に伝える。
-- こうへいはプログラミング素人。丁寧に、しかし冗長にならずに。
-
-### メッセージ末尾の更新日時
-- ユーザーへのメッセージには毎回更新日時を記載すること。
-
-### 末尾タグ（絶対遵守）
-- 毎回のメッセージ末尾に以下を記載:
-  [GEMINI_LAST] （Geminiの最後の実質的発言）
-  [GPT_LAST] （GPTの最後の実質的発言）
-
-### 監査官メッセージの統合
-- GPT・Gemini向けの監査メッセージは常に1通に統合して提出。
-- 2通以上に分割しない。
-
-### GitHub運用
-- PATトークンはこうへいがスレッド冒頭で提供。毎回要求すること。
-- pushは毎回単一commitで行う。
-- SHA固定raw URLを監査官メッセージに必ず含める。
+- 毎回こうへいに平易な説明を添える
+- 末尾タグ [GEMINI_LAST] / [GPT_LAST] を毎回記載
+- 監査官メッセージは1通統合・コードブロック・冒頭で名乗る
+- PATはpush後即除去。.envは絶対にコミットしない
+- VMAメソッドのトレードロジックは不可侵（変更はユーザー承認必須）
+- 更新日時を毎回記載
