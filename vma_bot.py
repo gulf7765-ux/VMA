@@ -1,5 +1,5 @@
 """
-VMA - VM Advance Trading System v5.300
+VMA - VM Advance Trading System v5.400
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 BB背景分析最優先 × Gemini合議 × Python側異常ガード
 
@@ -49,7 +49,7 @@ from dotenv import load_dotenv
 # §1. 定数定義
 # ============================================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-VERSION = "5.300"  # DDバイパスspread限定 + B'上書き + PostSignalGate
+VERSION = "5.400"  # CLOSE凍結 + TP/RR Gate + spread_anomaly独立
 
 # --- 通貨ペア ---
 SYMBOL = "USDJPY"
@@ -1680,9 +1680,10 @@ GEMINI_RESPONSE_SCHEMA = {
         "council_d": {"type": "STRING"},
         "action": {"type": "STRING", "enum": ["BUY", "SELL", "WAIT", "CLOSE"]},
         "sl": {"type": "NUMBER"},
+        "tp": {"type": "NUMBER"},
         "reason": {"type": "STRING"},
     },
-    "required": ["action", "sl", "reason", "council_a", "council_b", "council_c", "council_d"],
+    "required": ["action", "sl", "tp", "reason", "council_a", "council_b", "council_c", "council_d"],
 }
 
 
@@ -1732,9 +1733,9 @@ def ask_gemini_council(market_json: str, ref_images: List[PIL.Image.Image],
     return '{"action":"WAIT","sl":0,"reason":"APIエラー","council_a":"","council_b":"","council_c":"","council_d":""}'
 
 
-def parse_decision(decision: str) -> Tuple[str, float]:
-    """Gemini応答をパースしてaction, slを抽出"""
-    action, sl = "WAIT", 0.0
+def parse_decision(decision: str) -> Tuple[str, float, float]:
+    """Gemini応答をパースしてaction, sl, tpを抽出"""
+    action, sl, tp = "WAIT", 0.0, 0.0
     try:
         clean = re.sub(r"^```(?:json)?\s*", "", decision.strip())
         clean = re.sub(r"\s*```$", "", clean)
@@ -1746,6 +1747,9 @@ def parse_decision(decision: str) -> Tuple[str, float]:
             raw_sl = parsed.get("sl", 0)
             if raw_sl and float(raw_sl) > 0:
                 sl = float(raw_sl)
+            raw_tp = parsed.get("tp", 0)
+            if raw_tp and float(raw_tp) > 0:
+                tp = float(raw_tp)
     except Exception:
         act_m = re.search(r"ACTION:\s*(BUY|SELL|WAIT|CLOSE)", decision, re.IGNORECASE)
         action = act_m.group(1).upper() if act_m else "WAIT"
@@ -1764,7 +1768,7 @@ def parse_decision(decision: str) -> Tuple[str, float]:
             if dist > SL_MAX_DISTANCE_PIPS or not dir_ok:
                 logging.warning(f"SL検証失敗: {sl}")
                 sl = 0.0
-    return action, sl
+    return action, sl, tp
 
 
 def sanitize_gemini_output(text: str, max_length: int = 5000) -> str:
@@ -1794,7 +1798,8 @@ def sanitize_gemini_output(text: str, max_length: int = 5000) -> str:
 # §19a. PostSignalGate（エントリー前関門）— PhantomOS準拠
 # ============================================================================
 def check_post_signal_gate(action: str, entry_price: float, sl_price: float,
-                           state: BotState, anomaly_result: Dict[str, Any]) -> Tuple[bool, str]:
+                           tp_price: float, state: BotState,
+                           anomaly_result: Dict[str, Any]) -> Tuple[bool, str]:
     """
     Geminiが返したBUY/SELLをPython側で物理的にチェック。
     幻覚（あり得ないロット/逆方向SL等）を遮断する最後の防衛線。
@@ -1843,18 +1848,34 @@ def check_post_signal_gate(action: str, entry_price: float, sl_price: float,
         if bb_w < 50.0 and sma_a < 30.0:
             return False, f"M30スクイーズ: BB幅{bb_w:.1f}pip, SMA角度{sma_a:.1f}度"
 
-    logging.info(f"【Gate APPROVED】{action} entry={entry_price} sl={sl_price} sl_pips={sl_pips:.1f}")
+    # G7: 最低RR比（TP:SL >= 1.5:1）— VMA「損小利大」原則
+    if tp_price > 0 and sl_pips > 0:
+        tp_pips = price_to_pips(abs(tp_price - entry_price))
+        rr_ratio = tp_pips / sl_pips if sl_pips > 0 else 0
+        if rr_ratio < GATE_MIN_RR_RATIO:
+            return False, f"RR比不足: {rr_ratio:.2f} < 最低{GATE_MIN_RR_RATIO}（TP {tp_pips:.1f}pip / SL {sl_pips:.1f}pip）"
+    elif tp_price <= 0 and action in ("BUY", "SELL"):
+        # TPなしの場合: 警告ログのみ（拒否はしない。Geminiが省略する場合がある）
+        logging.warning(f"【Gate警告】TP未指定。RR比チェックをスキップ。")
+
+    logging.info(f"【Gate APPROVED】{action} entry={entry_price} sl={sl_price} tp={tp_price} sl_pips={sl_pips:.1f}")
     return True, ""
 
 
 # ============================================================================
 # §19b. アクション処理
 # ============================================================================
-def handle_action(action: str, sl: float, has_pos: bool, p: Any, decision: str,
+def handle_action(action: str, sl: float, tp: float, has_pos: bool, p: Any, decision: str,
                   is_entry_allowed: bool, state: BotState, council_label: str = "",
                   anomaly_result: Optional[Dict[str, Any]] = None) -> None:
     """Gemini合議結果に基づきトレードを実行（PostSignalGate統合）"""
+    # ★CLOSE時もfreeze_market_ordersを確認（成行決済は凍結対象）
+    freeze = (anomaly_result or {}).get("freeze_market_orders", False)
+
     if action == "CLOSE" and has_pos:
+        if freeze:
+            logging.warning("【CLOSE拒否】freeze_market_orders中: 成行決済を凍結。SLに委ねる。")
+            return
         if close_position(p.ticket, p.type, p.volume):
             tracker = state.open_trades.pop(p.ticket, None)
             if tracker:
@@ -1890,7 +1911,7 @@ def handle_action(action: str, sl: float, has_pos: bool, p: Any, decision: str,
 
         # ★PostSignalGate: エントリー前の最終関門
         gate_ok, gate_reason = check_post_signal_gate(
-            action, entry, sl, state, anomaly_result or {})
+            action, entry, sl, tp, state, anomaly_result or {})
         if not gate_ok:
             logging.warning(f"【Gate REJECTED】{gate_reason}")
             send_line_notify(f"⛔ エントリー拒否\n{gate_reason}")
@@ -2170,14 +2191,14 @@ def main_loop() -> None:
                     phase_mgr.transition("council_done")
 
                     logging.info(f"【AI合議結果】\n{sanitize_gemini_output(decision, 3000)}")
-                    act, sl_val = parse_decision(decision)
+                    act, sl_val, tp_val = parse_decision(decision)
 
                     persistence_db.insert_council_log(council_label, act, sl_val, {"decision": decision[:500]})
 
                     entry_allowed = (is_entry_window(now) and not is_restricted_time(now)
                                      and not entry_blocked_by_anomaly
                                      and dd_stage not in ("HALT", "DISQUALIFY"))
-                    handle_action(act, sl_val, has_pos, p, decision, entry_allowed, state, council_label, anomaly)
+                    handle_action(act, sl_val, tp_val, has_pos, p, decision, entry_allowed, state, council_label, anomaly)
                     state.save()
 
                 time.sleep(MAIN_LOOP_INTERVAL)
