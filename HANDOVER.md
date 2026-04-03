@@ -1,5 +1,5 @@
 # VMA Handover
-最終更新: 2026-04-03
+最終更新: 2026-04-04
 
 ---
 
@@ -7,27 +7,35 @@
 
 ### プロジェクト状態
 - プロジェクト名: VMA（VM Advance Trading System）
-- 現在バージョン: v5.401
-- 段階: **両監査官承認済み** → 次フェーズ（自壊前兆監視）へ移行
+- 現在バージョン: v5.500
+- 段階: v5.401承認済み → v5.500(§21 SDM追加) → 監査提出中
 - GitHub: https://github.com/gulf7765-ux/VMA
-- 最新SHA: 26f678e749e956f0f6ba156a154ffb53cc71acca
+- 最新SHA: 5fd04a4
 
-### 監査結果
+### 監査結果（v5.401時点）
 - **GPT: 承認（Blocker 0 / Major 0）** Minor 2件のみ
 - **Gemini: 完全承認（Blocker 0 / Major 0）** v5.300から3回連続承認
 
-### GPT残Minor（次便で対応可）
-1. WAIT系フォールバックJSONにtp:0が未設定
-2. docstring先頭がv5.400のまま（VERSION定数は5.401）
+### v5.500で追加した内容
+- §21 SelfDestructionMonitor: 自壊前兆3段階検知(CAUTION/WARNING/CRITICAL)
+- PersistenceDB.get_recent_council_logs(): 合議ログ取得メソッド
+- get_dynamic_risk(): SDM WARNING時のリスク半減を組み込み（DD/連敗と複合適用）
+- BotState: sdm_critical_pause_untilフィールド追加（再起動耐性）
+- main_loop: SDM定期チェック(5分間隔) + エントリー停止判定 + LINE通知
+- docstring先頭をv5.500に更新（GPT Minor 2解消）
+
+### GPT残Minor（v5.401時点）
+1. WAIT系フォールバックJSONにtp:0が未設定 → 未対応
+2. docstring先頭がv5.400のまま → **v5.500で解消**
 
 ### リポジトリ構成
-- vma_bot.py (2219行) メインBOT
+- vma_bot.py (2605行) メインBOT
 - supervisor.py (120行) プロセス監視
 - charter.md Gemini実行憲章（TP追加済み）
 - HANDOVER.md 本ファイル
 - README.md / requirements.txt / .env.example / .gitignore
 
-### 実装済み安全装置（v5.401時点）
+### 実装済み安全装置（v5.500時点）
 1. AnomalyGuard: スプレッド/凍結/ジャンプ即時検知、段階復帰、手動ロック
 2. DD 4層: WARNING(8%)/REDUCTION(10%)/HALT(15%)/DISQUALIFY(20%)
 3. PostSignalGate G1-G7: SL方向/距離/リスク金額/スプレッド/重複/スクイーズ/RR比
@@ -36,12 +44,13 @@
 6. タイムストップ: 180分+1R未満→撤退
 7. 非線形R倍数トレーリング: 1R/2R/3R/4R段階制
 8. DD DISQUALIFYバイパス: spread_anomaly起因のみ
+9. §21 SelfDestructionMonitor: 自壊前兆3段階(CAUTION/WARNING/CRITICAL)
 
 ### 修正履歴
-v5.000→v5.100→v5.200→v5.300→v5.400→v5.401(承認)
+v5.000→v5.100→v5.200→v5.300→v5.400→v5.401(承認)→v5.500(SDM追加)
 
-### 次のステップ（両監査官同意済み）
-1. 自壊前兆監視
+### 次のステップ
+1. ~~自壊前兆監視~~ → v5.500で実装済み、監査待ち
 2. analyzer.py移植
 3. VMA専用憲章整備
 
@@ -54,8 +63,9 @@ v5.000→v5.100→v5.200→v5.300→v5.400→v5.401(承認)
 
 ## B. 監査官向けHandover
 
-### 承認済み: v5.401 (SHA: 26f678e)
-GPT/Gemini両監査官承認。Blocker 0 / Major 0。
+### 最新提出: v5.500 (SHA: 5fd04a4) — 監査待ち
+前版v5.401はGPT/Gemini両監査官承認済み。
+v5.500は§21 SelfDestructionMonitor追加。新規コード約300行。
 
 ### 監査ラウンド履歴
 1. v5.000 → 差し戻し（Blocker4件）
@@ -64,6 +74,7 @@ GPT/Gemini両監査官承認。Blocker 0 / Major 0。
 4. v5.300 → Gemini承認、GPT差し戻し
 5. v5.400 → Gemini承認、GPT差し戻し
 6. v5.401 → **両者承認**
+7. v5.500 → 監査待ち（§21 SDM追加）
 
 ### 監査官の最後の発言
 - GPT: 「承認。次は自壊前兆監視→analyzer→憲章」
