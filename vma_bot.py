@@ -49,16 +49,22 @@ from dotenv import load_dotenv
 # §1. 定数定義
 # ============================================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-VERSION = "5.000"
+VERSION = "5.100"  # Blocker1/2/3 + Major4(B') + DD4層 + Minor6
 
 # --- 通貨ペア ---
 SYMBOL = "USDJPY"
 MAGIC_NUMBER = 20260403
 
-# --- リスク管理 ---
+# --- リスク管理（PhantomOS DD4層準拠）---
 BASE_RISK_PERCENT = 0.02           # 標準リスク (2%)
 MIN_SL_PIPS = 5.0                  # SL下限 (5pips)
 SL_MAX_DISTANCE_PIPS = 80.0        # SL許容最大乖離 (pips)
+DD_WARNING_PCT = 8.0               # DD4層: 警告 (8%)
+DD_REDUCTION_PCT = 10.0            # DD4層: リスク半減 (10%)
+DD_HALT_PCT = 15.0                 # DD4層: 新規停止 (15%)
+DD_DISQUALIFY_PCT = 20.0           # DD4層: 全決済+停止 (20%)
+DD_RECOVERY_PCT = 5.0              # 半減→復帰 (5%)
+DAILY_LOSS_LIMIT_PCT = 3.0         # 日次損失上限 (3%)
 
 # --- トレーリングストップ ---
 TRAIL_START_PIPS = 20.0            # フォールバック開始利益 (pips)
@@ -75,6 +81,7 @@ STATE_B_MIN_THRESHOLD_PIPS = 25.0  # 状態B最低閾値 (pips)
 STATE_B_ATR_MULTIPLIER = 3.0       # 状態B ATR倍率
 STATE_B_VOLUME_RATIO = 1.5         # 状態B出来高倍率
 STATE_B_BB_EXPANSION_PIPS = 5.0    # 状態B BB拡大判定 (pips)
+STATE_B_FLAG_TTL_SECONDS = 1800    # B'急変動フラグ寿命 (30分)
 
 # --- エントリー ---
 ENTRY_WINDOW_MINUTES = 5           # 確定後許可時間 (分)
@@ -84,10 +91,16 @@ ORDER_DEVIATION = 50               # スリッページ許容 (ポイント)
 # --- Python側異常ガード（APIを使わない即時判定）---
 SPREAD_WARN_PIPS = 3.0             # スプレッド警告閾値 (pips)
 SPREAD_BLOCK_PIPS = 5.0            # スプレッド エントリー禁止閾値 (pips)
-SPREAD_EMERGENCY_PIPS = 10.0       # スプレッド 緊急決済閾値 (pips)
 TICK_FREEZE_SECONDS = 30           # ティック凍結検知 (秒)
 PRICE_JUMP_PIPS = 30.0             # 瞬間価格ジャンプ検知 (pips)
 ANOMALY_COOLDOWN_SECONDS = 60      # 異常検知後のクールダウン (秒)
+ANOMALY_RECOVERY_TICKS = 10        # 復帰に必要な正常ティック連続回数
+ANOMALY_ESCALATION_COUNT = 3       # 手動解除に格上げする再発回数
+ANOMALY_ESCALATION_WINDOW = 1800   # 再発カウントのローリング窓 (30分)
+
+# --- エントリー前関門（PostSignalGate）---
+GATE_MAX_RISK_PCT = 0.03           # 1トレード最大リスク (3%)
+GATE_MIN_RR_RATIO = 1.5            # 最低リスクリワード比
 
 # --- タイマー ---
 CACHE_INTERVAL_SECONDS = 1800      # D1/H4キャッシュ更新間隔 (秒)
@@ -226,42 +239,65 @@ class PhaseManager:
 
 
 # ============================================================================
-# §4. Python側異常ガード（AnomalyGuard）
+# §4. Python側異常ガード（AnomalyGuard）— Blocker 1/2対応
 # ============================================================================
 class AnomalyGuard:
     """
     Gemini APIを使わず、Python側で即時に異常を検知・遮断する。
-    毎ループ(10秒)で呼び出され、以下を監視:
-      1. スプレッド急拡大 → エントリー禁止 / 緊急決済
-      2. ティック凍結 → MT5接続異常
-      3. 瞬間価格ジャンプ → フラッシュクラッシュ/スパイク
+    
+    設計原則（PhantomOS実装憲章準拠）:
+      「安全装置が致命傷を引き起こしてはならない」
+      → スプレッド異常時の成行決済は行わない。既存ポジはSLに任せる。
+      → 凍結するのは「成行注文を伴う操作」のみ。トレーリング更新は維持。
+    
+    監視対象:
+      1. スプレッド急拡大 → エントリー禁止 + 成行操作凍結
+      2. ティック凍結 → エントリー禁止
+      3. 瞬間価格ジャンプ → エントリー禁止
+    
+    復帰条件（Blocker 2対応 — 時間だけでは復帰しない）:
+      段階1: 直近N回のティックでスプレッドがBLOCK閾値未満
+      段階2: ティック更新が正常（凍結なし）連続N回
+      段階3: 上記を満たした上でクールダウン秒数経過
+      再発3回(30分窓) → 手動解除に格上げ
     """
 
     def __init__(self):
         self._last_tick_time: Optional[float] = None
         self._last_bid: Optional[float] = None
         self._last_anomaly_time: Optional[float] = None
-        self._spread_history: List[float] = []  # 直近N個のスプレッド (pips)
+        self._spread_history: List[float] = []
+        self._normal_tick_streak: int = 0      # 正常ティック連続回数
+        self._halted: bool = False              # 現在ANOMALY_HALTED中か
+        self._manual_lock: bool = False         # 手動解除ロック
+        self._halt_timestamps: List[float] = [] # 再発カウント用タイムスタンプ
         self._lock = threading.Lock()
 
     def check(self, tick) -> Dict[str, Any]:
         """
-        tickオブジェクト(mt5.symbol_info_tick)を受け取り、異常状態を返す。
-        
         Returns:
             {
-                "block_entry": bool,      # エントリー禁止
-                "emergency_close": bool,   # 緊急全決済
-                "tick_frozen": bool,       # ティック凍結
-                "alerts": [str, ...],      # 警告メッセージリスト
+                "block_entry": bool,        # 新規エントリー禁止
+                "freeze_market_orders": bool, # 成行決済操作凍結(タイムストップ/状態C CLOSE)
+                "tick_frozen": bool,        # ティック凍結
+                "manual_locked": bool,      # 手動解除ロック中
+                "alerts": [str, ...],
             }
         """
         result = {
             "block_entry": False,
-            "emergency_close": False,
+            "freeze_market_orders": False,
             "tick_frozen": False,
+            "manual_locked": False,
             "alerts": [],
         }
+
+        if self._manual_lock:
+            result["block_entry"] = True
+            result["freeze_market_orders"] = True
+            result["manual_locked"] = True
+            result["alerts"].append("🔴 手動解除ロック中: 異常が短時間に繰り返し発生")
+            return result
 
         if tick is None:
             result["block_entry"] = True
@@ -271,28 +307,27 @@ class AnomalyGuard:
 
         now = time.time()
         spread_pips = price_to_pips(tick.ask - tick.bid)
+        is_anomaly = False
 
         with self._lock:
-            # --- 1. スプレッド監視 ---
             self._spread_history.append(spread_pips)
             if len(self._spread_history) > 30:
                 self._spread_history = self._spread_history[-30:]
 
-            if spread_pips >= SPREAD_EMERGENCY_PIPS:
-                result["emergency_close"] = True
+            # --- 1. スプレッド監視（成行決済は行わない）---
+            if spread_pips >= SPREAD_BLOCK_PIPS:
                 result["block_entry"] = True
+                result["freeze_market_orders"] = True  # 成行操作凍結
+                is_anomaly = True
+                self._normal_tick_streak = 0
                 result["alerts"].append(
-                    f"🔴 スプレッド緊急閾値超過: {spread_pips:.1f}pips (閾値{SPREAD_EMERGENCY_PIPS})"
-                )
-            elif spread_pips >= SPREAD_BLOCK_PIPS:
-                result["block_entry"] = True
-                result["alerts"].append(
-                    f"🟡 スプレッド異常: {spread_pips:.1f}pips → エントリー禁止"
+                    f"🟡 スプレッド異常: {spread_pips:.1f}pips → エントリー禁止+成行凍結"
                 )
             elif spread_pips >= SPREAD_WARN_PIPS:
-                result["alerts"].append(
-                    f"⚠️ スプレッド拡大中: {spread_pips:.1f}pips"
-                )
+                result["alerts"].append(f"⚠️ スプレッド拡大中: {spread_pips:.1f}pips")
+                self._normal_tick_streak += 1
+            else:
+                self._normal_tick_streak += 1
 
             # --- 2. ティック凍結検知 ---
             if self._last_tick_time is not None:
@@ -300,8 +335,10 @@ class AnomalyGuard:
                 if elapsed >= TICK_FREEZE_SECONDS:
                     result["tick_frozen"] = True
                     result["block_entry"] = True
+                    is_anomaly = True
+                    self._normal_tick_streak = 0
                     result["alerts"].append(
-                        f"🔴 ティック凍結: {elapsed:.0f}秒更新なし (閾値{TICK_FREEZE_SECONDS}秒)"
+                        f"🔴 ティック凍結: {elapsed:.0f}秒更新なし"
                     )
             self._last_tick_time = now
 
@@ -310,35 +347,74 @@ class AnomalyGuard:
                 jump_pips = abs(price_to_pips(tick.bid - self._last_bid))
                 if jump_pips >= PRICE_JUMP_PIPS:
                     result["block_entry"] = True
+                    is_anomaly = True
+                    self._normal_tick_streak = 0
                     result["alerts"].append(
-                        f"🔴 価格ジャンプ検知: {jump_pips:.1f}pips (閾値{PRICE_JUMP_PIPS})"
+                        f"🔴 価格ジャンプ: {jump_pips:.1f}pips"
                     )
             self._last_bid = tick.bid
 
-            # --- クールダウン中はエントリー禁止を維持 ---
+            # --- HALTED中の段階復帰判定 ---
+            if self._halted and not is_anomaly:
+                can_recover = (
+                    self._normal_tick_streak >= ANOMALY_RECOVERY_TICKS
+                    and self._last_anomaly_time is not None
+                    and (now - self._last_anomaly_time) >= ANOMALY_COOLDOWN_SECONDS
+                )
+                if can_recover:
+                    self._halted = False
+                    logging.info("【異常ガード】段階復帰条件クリア → MONITORING復帰可能")
+                else:
+                    result["block_entry"] = True
+                    result["freeze_market_orders"] = True
+
+            # --- 異常発生時: HALT + 再発カウント ---
+            if is_anomaly and not self._halted:
+                self._halted = True
+                self._last_anomaly_time = now
+                self._normal_tick_streak = 0
+                # 再発カウント（ローリング窓）
+                self._halt_timestamps.append(now)
+                self._halt_timestamps = [
+                    t for t in self._halt_timestamps
+                    if now - t <= ANOMALY_ESCALATION_WINDOW
+                ]
+                if len(self._halt_timestamps) >= ANOMALY_ESCALATION_COUNT:
+                    self._manual_lock = True
+                    result["manual_locked"] = True
+                    result["alerts"].append(
+                        f"🔴 {ANOMALY_ESCALATION_COUNT}回再発 → 手動解除ロック"
+                    )
+
+            # --- クールダウン中は禁止維持 ---
             if self._last_anomaly_time is not None:
                 if now - self._last_anomaly_time < ANOMALY_COOLDOWN_SECONDS:
                     result["block_entry"] = True
 
-            # 異常検知時にタイムスタンプ記録
-            if result["emergency_close"] or result["tick_frozen"]:
-                self._last_anomaly_time = now
-
         return result
 
     def get_avg_spread(self) -> float:
-        """直近の平均スプレッド (pips)"""
         with self._lock:
             if not self._spread_history:
                 return 0.0
             return sum(self._spread_history) / len(self._spread_history)
 
-    def is_in_cooldown(self) -> bool:
-        """異常検知後のクールダウン中か"""
+    def is_halted(self) -> bool:
         with self._lock:
-            if self._last_anomaly_time is None:
-                return False
-            return (time.time() - self._last_anomaly_time) < ANOMALY_COOLDOWN_SECONDS
+            return self._halted
+
+    def is_manual_locked(self) -> bool:
+        with self._lock:
+            return self._manual_lock
+
+    def unlock_manual(self) -> None:
+        """手動解除（外部から呼ぶ）"""
+        with self._lock:
+            self._manual_lock = False
+            self._halted = False
+            self._halt_timestamps.clear()
+            self._normal_tick_streak = 0
+            logging.info("【異常ガード】手動解除実行")
 
 
 # ============================================================================
@@ -690,14 +766,94 @@ def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return tr.rolling(period).mean()
 
 
+def calculate_adx(df: pd.DataFrame, period: int = 9) -> pd.DataFrame:
+    """ADX(期間9)を計算。VMA詳細版第1章準拠。"""
+    high, low, close = df["high"], df["low"], df["close"]
+    plus_dm = high.diff()
+    minus_dm = -low.diff()
+    plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0.0)
+    minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0.0)
+    tr = pd.concat([high - low, (high - close.shift(1)).abs(), (low - close.shift(1)).abs()], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1/period, min_periods=period).mean()
+    plus_di = 100 * (plus_dm.ewm(alpha=1/period, min_periods=period).mean() / atr)
+    minus_di = 100 * (minus_dm.ewm(alpha=1/period, min_periods=period).mean() / atr)
+    dx = 100 * ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan))
+    adx = dx.ewm(alpha=1/period, min_periods=period).mean()
+    return pd.DataFrame({"ADX": adx, "PLUS_DI": plus_di, "MINUS_DI": minus_di})
+
+
+def calculate_macd(df: pd.DataFrame, fast: int = 12, slow: int = 26, signal: int = 9) -> pd.DataFrame:
+    """MACD(12,26,9)を計算。VMA詳細版第1章準拠。"""
+    ema_fast = df["close"].ewm(span=fast, adjust=False).mean()
+    ema_slow = df["close"].ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    return pd.DataFrame({"MACD": macd_line, "SIGNAL": signal_line, "HIST": macd_line - signal_line})
+
+
+def calculate_stoch(df: pd.DataFrame, k_period: int = 12, k_smooth: int = 3, d_smooth: int = 3) -> pd.DataFrame:
+    """ストキャスティクス(スロー, 12,3,3)。VMA詳細版第1章準拠。SLOW%D重視。"""
+    low_min = df["low"].rolling(k_period).min()
+    high_max = df["high"].rolling(k_period).max()
+    fast_k = 100 * (df["close"] - low_min) / (high_max - low_min).replace(0, np.nan)
+    slow_k = fast_k.rolling(k_smooth).mean()  # %K
+    slow_d = slow_k.rolling(d_smooth).mean()   # SLOW%D
+    return pd.DataFrame({"SLOW_K": slow_k, "SLOW_D": slow_d})
+
+
+def classify_slope(series: pd.Series, n: int = 3) -> str:
+    """直近n本の傾きをUP/DOWN/FLATに分類"""
+    if series is None or len(series) < n:
+        return "FLAT"
+    vals = series.iloc[-n:].values
+    if np.any(np.isnan(vals)):
+        return "FLAT"
+    diff = vals[-1] - vals[0]
+    if diff > 0:
+        return "UP"
+    elif diff < 0:
+        return "DOWN"
+    return "FLAT"
+
+
+def get_last_n(series: pd.Series, n: int = 3) -> List[float]:
+    """直近n本の値をリストで返す（Geminiに時系列で渡すため）"""
+    if series is None or len(series) < n:
+        return []
+    vals = series.iloc[-n:].values
+    return [round(float(v), 4) if not np.isnan(v) else 0.0 for v in vals]
+
+
+def classify_sigma_position(price: float, sma: float, std: float) -> str:
+    """価格のσ帯位置を分類"""
+    if std == 0:
+        return "AT_SMA"
+    z = (price - sma) / std
+    if z > 3:
+        return "ABOVE_+3S"
+    elif z > 2:
+        return "+2S_to_+3S"
+    elif z > 1:
+        return "+1S_to_+2S"
+    elif z > 0:
+        return "SMA_to_+1S"
+    elif z > -1:
+        return "-1S_to_SMA"
+    elif z > -2:
+        return "-2S_to_-1S"
+    elif z > -3:
+        return "-3S_to_-2S"
+    return "BELOW_-3S"
+
+
 def fetch_and_calc_labels(timeframe: int) -> Optional[Dict[str, Any]]:
-    """指定時間足のテクニカルラベルを計算する"""
+    """指定時間足のテクニカルラベルを計算する（Blocker3対応: ADX/MACD/Stoch追加）"""
     rates = mt5.copy_rates_from_pos(SYMBOL, timeframe, 0, 100)
     if rates is None or len(rates) < 30:
         return None
     df = pd.DataFrame(rates)
     df["sma21"] = df["close"].rolling(21).mean()
-    df["std21"] = df["close"].rolling(21).std()
+    df["std21"] = df["close"].rolling(21).std(ddof=1)  # Minor6: ddof統一
 
     sma_drop = df["sma21"].dropna()
     m_dir, m_str = analyze_momentum(sma_drop)
@@ -712,25 +868,90 @@ def fetch_and_calc_labels(timeframe: int) -> Optional[Dict[str, Any]]:
     bb_l3 = current_sma - 3 * current_std
     bb_u2 = current_sma + 2 * current_std
     bb_l2 = current_sma - 2 * current_std
+    bb_width = price_to_pips(bb_u3 - bb_l3)
 
-    return {
+    # BB幅の変化（直近3本）
+    std_series = df["std21"].dropna()
+    if len(std_series) >= 3:
+        w_now = float(std_series.iloc[-1])
+        w_prev = float(std_series.iloc[-3])
+        bb_change = "EXPANDING" if w_now > w_prev * 1.02 else ("CONTRACTING" if w_now < w_prev * 0.98 else "STABLE")
+    else:
+        bb_change = "STABLE"
+
+    # σ帯位置
+    sigma_pos = classify_sigma_position(current_close, current_sma, current_std)
+
+    # レジサポ距離（直近50本の高安値）
+    recent_high = float(df["high"].iloc[-50:].max())
+    recent_low = float(df["low"].iloc[-50:].min())
+    nearest_resistance_pips = round(price_to_pips(recent_high - current_close), 1)
+    nearest_support_pips = round(price_to_pips(current_close - recent_low), 1)
+
+    result = {
         "PRICE_POSITION": price_position,
         "CURRENT_CLOSE": round(current_close, 3),
         "SMA21_VALUE": round(current_sma, 3),
         "SMA21_DIR": f"{m_dir} ({m_str})",
         "SMA21_ANGLE": sma_angle,
-        "BB_WIDTH_PIPS": round(price_to_pips(bb_u3 - bb_l3), 1),
+        "SMA21_ANGLE_LAST3": get_last_n(pd.Series([
+            calculate_sma_angle(sma_drop.iloc[:-(2-i)] if i < 2 else sma_drop, 5)
+            for i in range(3)
+        ]), 3) if len(sma_drop) > 7 else [],
+        "BB_WIDTH_PIPS": round(bb_width, 1),
+        "BB_WIDTH_CHANGE": bb_change,
         "BB_UPPER_2S": round(bb_u2, 3),
         "BB_LOWER_2S": round(bb_l2, 3),
         "BB_UPPER_3S": round(bb_u3, 3),
         "BB_LOWER_3S": round(bb_l3, 3),
-        "RECENT_50_HIGH": float(df["high"].iloc[-50:].max()),
-        "RECENT_50_LOW": float(df["low"].iloc[-50:].min()),
+        "PRICE_SIGMA_POSITION": sigma_pos,
+        "NEAREST_RESISTANCE_PIPS": nearest_resistance_pips,
+        "NEAREST_SUPPORT_PIPS": nearest_support_pips,
+        "RECENT_50_HIGH": recent_high,
+        "RECENT_50_LOW": recent_low,
     }
+
+    # --- ADX (期間9) ---
+    try:
+        adx_df = calculate_adx(df, period=9)
+        adx_vals = adx_df["ADX"].dropna()
+        if len(adx_vals) >= 3:
+            result["ADX_VALUE"] = round(float(adx_vals.iloc[-1]), 1)
+            result["ADX_SLOPE"] = classify_slope(adx_vals, 3)
+            result["ADX_LAST3"] = get_last_n(adx_vals, 3)
+            result["PLUS_DI"] = round(float(adx_df["PLUS_DI"].iloc[-1]), 1)
+            result["MINUS_DI"] = round(float(adx_df["MINUS_DI"].iloc[-1]), 1)
+    except Exception:
+        pass
+
+    # --- MACD (12,26,9) ---
+    try:
+        macd_df = calculate_macd(df)
+        macd_vals = macd_df["MACD"].dropna()
+        if len(macd_vals) >= 3:
+            result["MACD_LINE"] = round(float(macd_vals.iloc[-1]), 5)
+            result["MACD_SIGNAL"] = round(float(macd_df["SIGNAL"].iloc[-1]), 5)
+            result["MACD_SLOPE"] = classify_slope(macd_vals, 3)
+            result["MACD_LINE_LAST3"] = get_last_n(macd_vals, 3)
+    except Exception:
+        pass
+
+    # --- ストキャスティクス (12,3,3) ---
+    try:
+        stoch_df = calculate_stoch(df)
+        slow_d = stoch_df["SLOW_D"].dropna()
+        if len(slow_d) >= 3:
+            result["STOCH_SLOW_D"] = round(float(slow_d.iloc[-1]), 1)
+            result["STOCH_SLOPE"] = classify_slope(slow_d, 3)
+            result["STOCH_SLOW_D_LAST3"] = get_last_n(slow_d, 3)
+    except Exception:
+        pass
+
+    return result
 
 
 def get_market_data_optimized() -> str:
-    """Geminiに渡す市場データJSON"""
+    """Geminiに渡す市場データJSON（M15/D1追加）"""
     now = datetime.datetime.now()
     last_upd, cached_data = cached_d1_h4.get()
 
@@ -745,15 +966,33 @@ def get_market_data_optimized() -> str:
         cached_data = new_data
 
     tick = mt5.symbol_info_tick(SYMBOL)
+    m30 = fetch_and_calc_labels(mt5.TIMEFRAME_M30)
+    m15 = fetch_and_calc_labels(mt5.TIMEFRAME_M15)
+    m5 = fetch_and_calc_labels(mt5.TIMEFRAME_M5)
+
+    # 時間足方向整合 (TF_ALIGNMENT)
+    tf_dirs = {}
+    for name, labels in [("M5", m5), ("M15", m15), ("M30", m30), ("H4", cached_data.get("H4")), ("D1", cached_data.get("D1"))]:
+        if labels and isinstance(labels, dict) and "SMA21_ANGLE" in labels:
+            angle = labels["SMA21_ANGLE"]
+            tf_dirs[name] = "UP" if angle > 5 else ("DOWN" if angle < -5 else "FLAT")
+        else:
+            tf_dirs[name] = "N/A"
+
     return json.dumps({
         "symbol": SYMBOL,
         "time": now.isoformat(),
         "bid": tick.bid if tick else 0.0,
         "ask": tick.ask if tick else 0.0,
-        "spread_pips": round(price_to_pips(tick.ask - tick.bid), 1) if tick else 0.0,
-        "Higher_TF_Labels": cached_data,
-        "M30_Labels": fetch_and_calc_labels(mt5.TIMEFRAME_M30),
-        "M5_Labels": fetch_and_calc_labels(mt5.TIMEFRAME_M5),
+        "SPREAD_PIPS": round(price_to_pips(tick.ask - tick.bid), 1) if tick else 0.0,
+        "ENTRY_WINDOW_OPEN": is_entry_window(now),
+        "RESTRICTED_TIME_ACTIVE": is_restricted_time(now),
+        "TF_ALIGNMENT": tf_dirs,
+        "D1_Labels": cached_data.get("D1", {"STATUS": "UNAVAILABLE"}),
+        "H4_Labels": cached_data.get("H4", {"STATUS": "UNAVAILABLE"}),
+        "M30_Labels": m30,
+        "M15_Labels": m15,
+        "M5_Labels": m5,
     }, ensure_ascii=False)
 
 
@@ -844,8 +1083,32 @@ class ChartCache:
 # ============================================================================
 # §11. 資金管理（エクイティカーブ・コントロール）
 # ============================================================================
+def get_dd_percent(state: BotState) -> float:
+    """現在のDD%を計算"""
+    acc = mt5.account_info()
+    if not acc:
+        return 0.0
+    equity = float(acc.equity)
+    if state.peak_balance <= 0:
+        return 0.0
+    return (state.peak_balance - equity) / state.peak_balance * 100.0
+
+
+def get_dd_stage(dd_pct: float) -> str:
+    """DD%からステージを判定（PhantomOS DD4層準拠）"""
+    if dd_pct >= DD_DISQUALIFY_PCT:
+        return "DISQUALIFY"
+    elif dd_pct >= DD_HALT_PCT:
+        return "HALT"
+    elif dd_pct >= DD_REDUCTION_PCT:
+        return "REDUCTION"
+    elif dd_pct >= DD_WARNING_PCT:
+        return "WARNING"
+    return "NORMAL"
+
+
 def get_dynamic_risk(state: BotState) -> float:
-    """口座残高と連敗数から動的リスクを計算"""
+    """DD4層+連敗から動的リスクを計算（PhantomOS DDMonitor準拠）"""
     acc = mt5.account_info()
     if not acc:
         return BASE_RISK_PERCENT
@@ -855,14 +1118,28 @@ def get_dynamic_risk(state: BotState) -> float:
         state.peak_balance = current_balance
         state.save()
 
-    dd_ratio = (state.peak_balance - current_balance) / state.peak_balance if state.peak_balance > 0 else 0.0
+    dd_pct = get_dd_percent(state)
+    stage = get_dd_stage(dd_pct)
 
-    if dd_ratio >= 0.10:
-        logging.info(f"【資金防衛】DD {dd_ratio:.1%} → リスク1%固定")
-        return 0.01
+    if stage == "DISQUALIFY":
+        logging.critical(f"【DD4層】DD {dd_pct:.1f}% ≧ {DD_DISQUALIFY_PCT}% → 全決済+停止")
+        return 0.0  # 呼び出し元で全決済処理
+    elif stage == "HALT":
+        logging.warning(f"【DD4層】DD {dd_pct:.1f}% ≧ {DD_HALT_PCT}% → 新規停止")
+        return 0.0  # 新規エントリー不可
+    elif stage == "REDUCTION":
+        logging.info(f"【DD4層】DD {dd_pct:.1f}% ≧ {DD_REDUCTION_PCT}% → リスク半減")
+        return BASE_RISK_PERCENT / 2.0
+    elif stage == "WARNING":
+        logging.info(f"【DD4層】DD {dd_pct:.1f}% ≧ {DD_WARNING_PCT}% → 警告")
+
+    if state.consecutive_losses >= 5:
+        logging.info(f"【資金防衛】{state.consecutive_losses}連敗 → リスク1/3")
+        return BASE_RISK_PERCENT / 3.0
     elif state.consecutive_losses >= 3:
         logging.info(f"【資金防衛】{state.consecutive_losses}連敗 → リスク半減")
         return BASE_RISK_PERCENT / 2.0
+
     return BASE_RISK_PERCENT
 
 
@@ -1310,7 +1587,7 @@ def detect_state_c(price: float) -> bool:
         return False
     closes = r["close"][-21:]
     m = np.mean(closes)
-    s = np.std(closes, ddof=0)
+    s = np.std(closes, ddof=1)  # Minor6: ddof統一(Pandas rolling.std()と一致)
     if np.isnan(m) or np.isnan(s) or s == 0:
         return False
     return price_to_pips(min(abs(price - m), abs(price - (m + 2*s)), abs(price - (m - 2*s)))) <= STATE_C_PROXIMITY_PIPS
@@ -1604,15 +1881,12 @@ def main_loop() -> None:
                     for alert in anomaly["alerts"]:
                         logging.warning(f"【異常ガード】{alert}")
 
-                if anomaly["emergency_close"]:
-                    logging.critical("【緊急決済】スプレッド異常による全決済を実行")
-                    spread = price_to_pips(tick.ask - tick.bid) if tick else 0.0
-                    persistence_db.insert_anomaly_event("emergency_close", spread, "; ".join(anomaly["alerts"]))
-                    close_all_positions_safely(state, "spread_emergency")
-                    phase_mgr.transition("anomaly_halt")
-                    send_line_notify(f"🔴【緊急停止】\n{chr(10).join(anomaly['alerts'])}")
-                    time.sleep(ANOMALY_COOLDOWN_SECONDS)
-                    phase_mgr.transition("anomaly_clear")
+                if anomaly["manual_locked"]:
+                    # 手動解除ロック: 全操作停止。LINE通知して待機。
+                    if not hasattr(main_loop, '_lock_notified'):
+                        send_line_notify("🔴【手動解除ロック】異常が繰り返し発生。手動確認が必要です。")
+                        main_loop._lock_notified = True
+                    time.sleep(MAIN_LOOP_INTERVAL)
                     continue
 
                 if anomaly["tick_frozen"]:
@@ -1623,6 +1897,23 @@ def main_loop() -> None:
                     time.sleep(ERROR_COOLDOWN)
                     continue
 
+                # 異常イベントのDB記録
+                if anomaly["block_entry"] and anomaly["alerts"]:
+                    spread = price_to_pips(tick.ask - tick.bid) if tick else 0.0
+                    persistence_db.insert_anomaly_event(
+                        "block_entry", spread, "; ".join(anomaly["alerts"]))
+
+                # --- DD4層チェック（PhantomOS DDMonitor準拠）---
+                dd_pct = get_dd_percent(state)
+                dd_stage = get_dd_stage(dd_pct)
+                if dd_stage == "DISQUALIFY":
+                    logging.critical(f"【DD DISQUALIFY】DD {dd_pct:.1f}% → 全決済+停止")
+                    close_all_positions_safely(state, "dd_disqualify")
+                    phase_mgr.transition("dd_lock")
+                    send_line_notify(f"🔴【DD DISQUALIFY】DD {dd_pct:.1f}%\n全決済+手動解除ロック")
+                    time.sleep(MAIN_LOOP_INTERVAL)
+                    continue
+
                 # --- 週末処理 ---
                 if is_weekend_close_time(now):
                     close_all_positions_safely(state, "weekend_close")
@@ -1631,10 +1922,15 @@ def main_loop() -> None:
                     phase_mgr.transition("weekday_resume")
                     continue
 
+                freeze_market = anomaly["freeze_market_orders"]
+
                 # --- 通常処理 ---
                 update_economic_calendar()
+                # トレーリングは常に実行（SL位置修正のみ、成行注文なし）
                 process_trailing_stop(state)
-                process_time_stop(state)
+                # タイムストップは成行決済を伴うため、異常時は凍結
+                if not freeze_market:
+                    process_time_stop(state)
                 update_trade_extremes(state)
 
                 # クローズ検知
@@ -1672,27 +1968,38 @@ def main_loop() -> None:
                     time.sleep(MAIN_LOOP_INTERVAL)
                     continue
 
-                # 異常ガードがブロック中はエントリーしない
+                # DD HALT以上は新規エントリー禁止
+                if dd_stage in ("HALT", "DISQUALIFY"):
+                    time.sleep(MAIN_LOOP_INTERVAL)
+                    continue
+
                 entry_blocked_by_anomaly = anomaly["block_entry"]
 
+                # --- 状態B → B'化: Geminiを呼ばず急変動フラグのみ記録 ---
                 is_b = detect_state_b()
                 is_c = has_pos and detect_state_c(tick.bid)
 
-                if not is_b:
-                    state.last_state_b_check = None
+                if is_b and not is_restricted_time(now) and not entry_blocked_by_anomaly:
+                    # B'フラグ記録（Geminiは呼ばない）
+                    if not hasattr(state, '_rapid_move_flag') or state._rapid_move_flag is None:
+                        state._rapid_move_flag = {
+                            "time": now.isoformat(),
+                            "timestamp": time.time(),
+                            "direction": "UP" if tick.bid > (state._rapid_move_flag or {}).get("_prev_bid", tick.bid) else "DOWN",
+                        }
+                        logging.info(f"【B'フラグ】急変動検知 → フラグ記録のみ（Geminiは呼ばない）")
+
                 if not is_c:
                     state.last_state_c_check = None
 
                 decision, triggered, council_label = "", False, ""
 
-                if has_pos and is_c:
+                # 状態C: 保有中の決済判断（freeze_market中は凍結）
+                if has_pos and is_c and not freeze_market:
                     if state.last_state_c_check is None or (now - state.last_state_c_check).total_seconds() >= STATE_C_COOLDOWN:
                         council_label, triggered = "状態C", True
                         state.last_state_c_check = now
-                elif is_b:
-                    if state.last_state_b_check is None or (now - state.last_state_b_check).total_seconds() >= STATE_B_COOLDOWN:
-                        council_label, triggered = "状態B", True
-                        state.last_state_b_check = now
+                # 状態A: M30確定後の通常合議（B'フラグがあれば付記）
                 elif is_entry_window(now):
                     cur_c = now.replace(minute=(30 if now.minute >= 30 else 0), second=0, microsecond=0)
                     if state.last_normal_entry_check != cur_c and not is_restricted_time(now):
@@ -1703,10 +2010,22 @@ def main_loop() -> None:
                     phase_mgr.transition("council_start")
                     logging.info(f"【合議開始: {council_label}】")
                     chart_cache.force_refresh()
-                    time.sleep(3)  # チャート生成待ち
+                    time.sleep(3)
 
                     market_json = get_market_data_optimized()
-                    decision = ask_gemini_council(market_json, ref_images, chart_cache.get_images())
+
+                    # B'フラグが生きていれば合議プロンプトに付記
+                    b_flag_note = ""
+                    if hasattr(state, '_rapid_move_flag') and state._rapid_move_flag is not None:
+                        flag = state._rapid_move_flag
+                        elapsed = time.time() - flag.get("timestamp", 0)
+                        if elapsed <= STATE_B_FLAG_TTL_SECONDS:
+                            b_flag_note = f"\n【参考情報】直前にM1レベルの急変動を検知（{flag.get('direction', 'N/A')}方向、{elapsed:.0f}秒前）。これは参考情報であり、エントリー方向へのバイアスとして使ってはならない。M30背景と不一致なら無視せよ。"
+                        # フラグ消費（次のM30確定まで1回限り）
+                        state._rapid_move_flag = None
+
+                    decision = ask_gemini_council(
+                        market_json + b_flag_note, ref_images, chart_cache.get_images())
                     phase_mgr.transition("council_done")
 
                     logging.info(f"【AI合議結果】\n{sanitize_gemini_output(decision, 3000)}")
@@ -1714,7 +2033,8 @@ def main_loop() -> None:
 
                     persistence_db.insert_council_log(council_label, act, sl_val, {"decision": decision[:500]})
 
-                    entry_allowed = is_entry_window(now) and not is_restricted_time(now) and not entry_blocked_by_anomaly
+                    entry_allowed = (is_entry_window(now) and not is_restricted_time(now)
+                                     and not entry_blocked_by_anomaly and dd_stage == "NORMAL")
                     handle_action(act, sl_val, has_pos, p, decision, entry_allowed, state, council_label)
                     state.save()
 
