@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Environment
+.env
+
+# Runtime data
+*.log
+*.jsonl
+*.db
+*.db-wal
+*.db-shm
+bot_state.json
+bot_state.json.tmp
+
+# Charts (generated at runtime)
+current_*.png
+analyzer_report.png
+analyzer_report.txt
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
