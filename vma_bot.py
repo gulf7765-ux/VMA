@@ -1,5 +1,5 @@
 """
-VMA - VM Advance Trading System v5.501
+VMA - VM Advance Trading System v5.502
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 BB背景分析最優先 × Gemini合議 × Python側異常ガード
 
@@ -50,7 +50,7 @@ from dotenv import load_dotenv
 # §1. 定数定義
 # ============================================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-VERSION = "5.501"  # §21 SDM修正: G-M1/G-M2/P-M1/G-m1/P-m2対応
+VERSION = "5.502"  # §21 SDM: 勝率→DD管轄に移管、通知ロジック修正
 
 # --- 通貨ペア ---
 SYMBOL = "USDJPY"
@@ -130,17 +130,15 @@ SDM_TRADE_WINDOW = 20              # ローリング集計対象トレード数
 SDM_COUNCIL_WINDOW = 30            # ローリング集計対象合議数
 SDM_CHECK_INTERVAL_SECONDS = 300   # 定期チェック間隔 (5分)
 # CAUTION閾値
-SDM_WIN_RATE_CAUTION = 0.35        # 勝率35%未満で注意
+# ★P-M1修正: 勝率はSDMの管轄外（レンジ相場で正常に下がる → DD4層が管轄）
 SDM_CONSECUTIVE_LOSS_CAUTION = 3   # 3連敗で注意
 SDM_SL_HIT_RATE_CAUTION = 0.60     # SL被弾率60%超で注意
 SDM_API_FAIL_RATE_CAUTION = 0.20   # API失敗率20%超で注意
 # WARNING閾値（リスク自動半減トリガー）
-SDM_WIN_RATE_WARNING = 0.25        # 勝率25%未満で警告
 SDM_CONSECUTIVE_LOSS_WARNING = 5   # 5連敗で警告
 SDM_SL_HIT_RATE_WARNING = 0.75     # SL被弾率75%超で警告
 SDM_API_FAIL_RATE_WARNING = 0.40   # API失敗率40%超で警告
 # CRITICAL閾値（新規エントリー一時停止トリガー）
-SDM_WIN_RATE_CRITICAL = 0.15       # 勝率15%未満で危機
 SDM_CONSECUTIVE_LOSS_CRITICAL = 7  # 7連敗で危機
 SDM_AVG_LOSS_WIN_RATIO_CRITICAL = 3.0  # 平均損失が平均利益の3倍超で危機
 SDM_CRITICAL_PAUSE_SECONDS = 3600  # 危機時の一時停止時間 (1時間)
@@ -601,8 +599,9 @@ persistence_db = PersistenceDB()
 # ============================================================================
 # §21. 自壊前兆監視（SelfDestructionMonitor）
 # ============================================================================
-# 目的: BOTが「自分で自分を壊す」前兆を検知し、自動的にブレーキをかける。
-# 具体例: Geminiが間違った判断を連発 / APIが不安定 / SL連続被弾 / 全部WAIT病
+# 目的: BOTの「構造的故障」の前兆を検知し、自動的にブレーキをかける。
+# 検知対象: API不安定 / 連敗集中 / SL被弾偏重 / 損益比の構造的崩壊
+# 検知対象外: レンジ相場での一時的勝率低下（→DD4層が管轄）
 #
 # 3段階エスカレーション:
 #   NORMAL  → 異常なし
@@ -704,9 +703,11 @@ class SelfDestructionMonitor:
         if should_notify and new_level != self.NORMAL:
             self._last_notified_level = new_level
 
-        # NORMALに戻ったら通知レベルをリセット
-        if new_level == self.NORMAL:
-            self._last_notified_level = self.NORMAL
+        # ★P-M2修正: レベルが低下したら通知記憶も引き下げる。
+        # 旧: NORMALに戻った時だけリセット → CRITICAL→WARNING→再CRITICALで再通知されないバグ
+        # 新: レベル低下時に_last_notified_levelも追従 → 再エスカレーション時に再通知される
+        if self._LEVEL_WEIGHT.get(new_level, 0) < self._LEVEL_WEIGHT.get(self._last_notified_level, 0):
+            self._last_notified_level = new_level
 
         # リスク乗数: WARNING→半減、CRITICAL→ゼロ（entry_pausedで判定）
         if new_level == self.CRITICAL:
@@ -727,10 +728,9 @@ class SelfDestructionMonitor:
         }
 
     def _analyze_trades(self, trades: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """直近トレードからSDM指標を算出"""
+        """直近トレードからSDM指標を算出（故障/構造崩壊指標のみ）"""
         result = {
             "trade_count": len(trades),
-            "win_rate": None,
             "consecutive_losses": 0,
             "sl_hit_rate": None,
             "avg_loss_win_ratio": None,
@@ -740,7 +740,6 @@ class SelfDestructionMonitor:
 
         wins = [t for t in trades if t.get("win", False)]
         losses = [t for t in trades if not t.get("win", True)]
-        result["win_rate"] = len(wins) / len(trades) if trades else None
 
         # 連敗数: 先頭（最新）から連続する負けの数
         consec = 0
@@ -797,7 +796,7 @@ class SelfDestructionMonitor:
         return result
 
     def _determine_level(self, metrics: Dict[str, Any]) -> Tuple[str, List[str]]:
-        """指標から最も深刻なレベルを判定"""
+        """指標から最も深刻なレベルを判定（故障/構造崩壊指標のみ）"""
         alerts: List[str] = []
         max_level = self.NORMAL
 
@@ -805,14 +804,9 @@ class SelfDestructionMonitor:
         council_count = metrics.get("council_count", 0)
 
         # --- CRITICAL判定（最も深刻）---
-        # ★P-M1修正: CRITICAL判定は母数をCAUTION/WARNINGと分離。
-        # 5件程度の少数不運でCRITICAL化するのを防ぐ。
+        # ★P-M1修正: CRITICAL判定は母数10件以上。
+        # ★勝率はSDM管轄外（レンジ相場で正常に下がる → DD4層が管轄）。
         if trade_count >= SDM_CRITICAL_MIN_TRADES:
-            wr = metrics.get("win_rate")
-            if wr is not None and wr < SDM_WIN_RATE_CRITICAL:
-                alerts.append(f"勝率{wr:.0%} < {SDM_WIN_RATE_CRITICAL:.0%}")
-                max_level = self.CRITICAL
-
             cl = metrics.get("consecutive_losses", 0)
             if cl >= SDM_CONSECUTIVE_LOSS_CRITICAL:
                 alerts.append(f"{cl}連敗 >= {SDM_CONSECUTIVE_LOSS_CRITICAL}")
@@ -826,11 +820,6 @@ class SelfDestructionMonitor:
         # --- WARNING判定 ---
         if max_level != self.CRITICAL:
             if trade_count >= 5:
-                wr = metrics.get("win_rate")
-                if wr is not None and wr < SDM_WIN_RATE_WARNING:
-                    alerts.append(f"勝率{wr:.0%} < {SDM_WIN_RATE_WARNING:.0%}")
-                    max_level = max(max_level, self.WARNING, key=lambda l: self._LEVEL_WEIGHT[l])
-
                 cl = metrics.get("consecutive_losses", 0)
                 if cl >= SDM_CONSECUTIVE_LOSS_WARNING:
                     alerts.append(f"{cl}連敗 >= {SDM_CONSECUTIVE_LOSS_WARNING}")
@@ -850,15 +839,10 @@ class SelfDestructionMonitor:
         # --- CAUTION判定 ---
         if max_level == self.NORMAL:
             if trade_count >= 5:
-                wr = metrics.get("win_rate")
-                if wr is not None and wr < SDM_WIN_RATE_CAUTION:
-                    alerts.append(f"勝率{wr:.0%} < {SDM_WIN_RATE_CAUTION:.0%}")
-                    max_level = self.CAUTION
-
                 cl = metrics.get("consecutive_losses", 0)
                 if cl >= SDM_CONSECUTIVE_LOSS_CAUTION:
                     alerts.append(f"{cl}連敗 >= {SDM_CONSECUTIVE_LOSS_CAUTION}")
-                    max_level = max(max_level, self.CAUTION, key=lambda l: self._LEVEL_WEIGHT[l])
+                    max_level = self.CAUTION
 
                 shr = metrics.get("sl_hit_rate")
                 if shr is not None and shr > SDM_SL_HIT_RATE_CAUTION:
