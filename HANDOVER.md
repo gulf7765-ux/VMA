@@ -8,18 +8,23 @@
 ### プロジェクト状態
 - プロジェクト名: VMA（VM Advance Trading System）
 - 現在バージョン: v5.505
-- 段階: v5.504(Gemini承認/GPT差し戻し) → v5.505修正 → 再監査待ち
+- 段階: **全フェーズ両監査官承認完了** → デモ稼働準備へ
 - GitHub: https://github.com/gulf7765-ux/VMA
 
-### v5.505で対応した監査指摘
-- P-M1(採用): 状態A/C別のaction契約がPython側で閉じていない → handle_actionに契約違反検証+WAITへ正規化+ログ
-- P-M2(採用): 通貨ペア対応の過大主張 → TradeTrackerにsymbol追加、log_trade_resultでtracker.symbol使用
-- P-m1(採用): HANDOVER版ズレ → v5.505に統一
+### 監査結果（v5.505）
+- **GPT: 承認** Major 2は説明補正で取り下げ。残り全件解消。
+- **Gemini: 完全承認（Blocker 0 / Major 0）**
 
-### 将来マルチペア方針（総司令官指示）
-- 多数通貨ペアで運用予定。同時に2ポジション以上は持たない。
-- TradeTrackerにsymbolフィールドを追加済み（構造受口確保）。
-- 現時点はUSDJPY単体で妥当。マルチペア化は将来課題。
+### 完了した全フェーズ
+1. ~~v5.401: BOT本体+安全装置~~ → 両者承認
+2. ~~v5.503: §21 SDM自壊前兆監視~~ → 両者承認
+3. ~~v5.504: analyzer.py移植~~ → 両者承認
+4. ~~v5.505: charter v2 + A/C契約検証 + symbol構造受口~~ → 両者承認
+
+### 将来マルチペア方針（総司令官指示・メモリ記録済み）
+- 複数通貨ペアのチャートを巡回監視→最初にエントリー条件成立したペアでエントリー→決済までそのペアのみ監視→決済後に巡回監視モードへ戻る
+- 同時2ポジション以上は持たない
+- 現時点はUSDJPY単体で妥当。マルチペア化はmain_loopの構造変更を伴う大改修であり、将来課題
 
 ### リポジトリ構成
 - vma_bot.py (2608行) メインBOT
@@ -28,7 +33,7 @@
 - charter.md Gemini実行憲章 v2
 - HANDOVER.md / README.md / requirements.txt / .env.example / .gitignore
 
-### 実装済み安全装置（v5.505時点）
+### 実装済み安全装置（v5.505時点・全10層）
 1. AnomalyGuard: スプレッド/凍結/ジャンプ即時検知
 2. DD 4層: WARNING(8%)/REDUCTION(10%)/HALT(15%)/DISQUALIFY(20%)
 3. PostSignalGate G1-G7
@@ -38,16 +43,13 @@
 7. 非線形R倍数トレーリング
 8. DD DISQUALIFYバイパス: spread_anomaly起因のみ
 9. §21 SDM: 連敗/SL被弾率/API失敗率/損益比
-10. 状態A/C action契約検証: 契約違反→WAITへ正規化
+10. 状態A/C action契約検証
 
 ### 修正履歴
-v5.000→...→v5.401(承認)→v5.500~v5.503(SDM承認)→v5.504(analyzer+charter)→v5.505
+v5.000→v5.401(承認)→v5.503(SDM承認)→v5.505(analyzer+charter承認)
 
 ### 次のステップ
-1. ~~自壊前兆監視~~ → 完了
-2. ~~analyzer.py移植~~ → 完了（監査中）
-3. ~~VMA専用憲章整備~~ → charter v2完了（監査中）
-4. デモ環境テスト
+- デモ環境テスト
 
 ### 技術注意
 - Geminiモデル: gemini-2.5-pro-preview-05-06
@@ -57,17 +59,17 @@ v5.000→...→v5.401(承認)→v5.500~v5.503(SDM承認)→v5.504(analyzer+chart
 
 ## B. 監査官向けHandover
 
-### 最新提出: v5.505 — 再監査待ち
+### 最新承認: v5.505 (SHA: 576e62c)
+GPT/Gemini両監査官承認。全フェーズ完了。
 
-### 監査ラウンド履歴（抜粋）
-6. v5.401 → **両者承認**
-9. v5.502 → **両者承認**（SDM完了）
-10. v5.504 → Gemini承認、GPT差し戻し（A/C契約+通貨ペア主張）
-11. v5.505 → 再監査待ち
+### 監査ラウンド履歴（主要マイルストーン）
+6. v5.401 → **両者承認**（BOT本体+安全装置）
+9. v5.502/v5.503 → **両者承認**（SDM自壊前兆監視）
+11. v5.505 → **両者承認**（analyzer+charter v2+A/C契約）
 
 ### 監査官の最後の発言
-- GPT: 「charter v2が導入した状態別契約をPython側が正式契約として受けていない」
-- Gemini: 「完全承認。Phase 4/5の中核完成」
+- GPT: 「Major 2は説明補正で解消。v5.505差し戻し理由としては使わない」
+- Gemini: 「全監査指摘事項がクリア。次のステップへの進行を許可」
 
 ---
 
