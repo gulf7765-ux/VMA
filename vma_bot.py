@@ -1,5 +1,5 @@
 """
-VMA - VM Advance Trading System v5.504
+VMA - VM Advance Trading System v5.505
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 BB背景分析最優先 × Gemini合議 × Python側異常ガード
 
@@ -50,7 +50,7 @@ from dotenv import load_dotenv
 # §1. 定数定義
 # ============================================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-VERSION = "5.504"  # log_trade_resultにrisk_pips/r_multiple/symbol追加 + charter v2
+VERSION = "5.505"  # A/C契約検証+TradeTracker symbol+HANDOVER版合わせ
 
 # --- 通貨ペア ---
 SYMBOL = "USDJPY"
@@ -1001,6 +1001,7 @@ class TradeTracker:
     sl_initial: float
     entry_time: str                         # ISO format
     council_label: str                      # "状態A" / "状態B" / "状態C"
+    symbol: str = SYMBOL                    # 約定通貨ペア（将来マルチペア化用）
     market_state: Dict[str, Any] = field(default_factory=dict)
     max_favorable_pips: float = 0.0
     max_adverse_pips: float = 0.0
@@ -1015,7 +1016,8 @@ class TradeTracker:
             "ticket": self.ticket, "direction": self.direction,
             "entry_price": self.entry_price, "sl_initial": self.sl_initial,
             "sl_current": self.sl_current, "entry_time": self.entry_time,
-            "council_label": self.council_label, "market_state": self.market_state,
+            "council_label": self.council_label, "symbol": self.symbol,
+            "market_state": self.market_state,
             "max_favorable_pips": round(self.max_favorable_pips, 1),
             "max_adverse_pips": round(self.max_adverse_pips, 1),
         }
@@ -1027,6 +1029,7 @@ class TradeTracker:
             entry_price=d["entry_price"], sl_initial=d["sl_initial"],
             entry_time=d["entry_time"],
             council_label=d.get("council_label", ""),
+            symbol=d.get("symbol", SYMBOL),
             market_state=d.get("market_state", {}),
             max_favorable_pips=d.get("max_favorable_pips", 0.0),
             max_adverse_pips=d.get("max_adverse_pips", 0.0),
@@ -1634,17 +1637,17 @@ def log_trade_result(tracker: TradeTracker, exit_price: float, exit_reason: str,
         entry_time = datetime.datetime.fromisoformat(tracker.entry_time)
         hold_seconds = (datetime.datetime.now() - entry_time).total_seconds()
         if tracker.direction == "BUY":
-            result_pips = price_to_pips(exit_price - tracker.entry_price)
+            result_pips = price_to_pips(exit_price - tracker.entry_price, tracker.symbol)
         else:
-            result_pips = price_to_pips(tracker.entry_price - exit_price)
+            result_pips = price_to_pips(tracker.entry_price - exit_price, tracker.symbol)
 
         if result_pips > 0:
             state.consecutive_losses = 0
         else:
             state.consecutive_losses += 1
 
-        # risk_pips: SL距離（本体のprice_to_pipsで統一計算）
-        risk_pips_val = price_to_pips(abs(tracker.entry_price - tracker.sl_initial))
+        # risk_pips: SL距離（本体のprice_to_pipsで統一計算、tracker.symbolで通貨ペア対応）
+        risk_pips_val = price_to_pips(abs(tracker.entry_price - tracker.sl_initial), tracker.symbol)
         if risk_pips_val <= 0:
             risk_pips_val = MIN_SL_PIPS  # フォールバック
         r_multiple = round(result_pips / risk_pips_val, 3)
@@ -1652,7 +1655,7 @@ def log_trade_result(tracker: TradeTracker, exit_price: float, exit_reason: str,
         record = {
             "timestamp": datetime.datetime.now().isoformat(),
             "ticket": tracker.ticket,
-            "symbol": SYMBOL,
+            "symbol": tracker.symbol,
             "direction": tracker.direction,
             "council_label": tracker.council_label,
             "entry_price": tracker.entry_price,
@@ -2207,6 +2210,17 @@ def handle_action(action: str, sl: float, tp: float, has_pos: bool, p: Any, deci
                   is_entry_allowed: bool, state: BotState, council_label: str = "",
                   anomaly_result: Optional[Dict[str, Any]] = None) -> None:
     """Gemini合議結果に基づきトレードを実行（PostSignalGate統合）"""
+
+    # ★P-M1修正: 状態別action契約検証（charter v2との一致を保証）
+    # 状態A合議: BUY/SELL/WAITのみ許可。CLOSEは契約違反→WAITへ正規化。
+    # 状態C合議: CLOSE/WAITのみ許可。BUY/SELLは契約違反→WAITへ正規化。
+    if council_label == "状態A" and action == "CLOSE":
+        logging.warning(f"【契約違反】状態AでCLOSE受信 → WAITへ正規化")
+        action = "WAIT"
+    elif council_label == "状態C" and action in ("BUY", "SELL"):
+        logging.warning(f"【契約違反】状態Cで{action}受信 → WAITへ正規化")
+        action = "WAIT"
+
     # ★CLOSE時もfreeze_market_ordersを確認（成行決済は凍結対象）
     freeze = (anomaly_result or {}).get("freeze_market_orders", False)
 
