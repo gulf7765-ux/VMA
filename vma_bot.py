@@ -1,5 +1,5 @@
 """
-VMA - VM Advance Trading System v5.502
+VMA - VM Advance Trading System v5.503
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 BB背景分析最優先 × Gemini合議 × Python側異常ガード
 
@@ -50,7 +50,7 @@ from dotenv import load_dotenv
 # §1. 定数定義
 # ============================================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-VERSION = "5.502"  # §21 SDM: 勝率→DD管轄に移管、通知ロジック修正
+VERSION = "5.503"  # §21 SDM: restore_pause通知記憶同期（GPT Minor対応）
 
 # --- 通貨ペア ---
 SYMBOL = "USDJPY"
@@ -649,6 +649,8 @@ class SelfDestructionMonitor:
         if pause_until > time.time():
             self._critical_pause_until = pause_until
             self._current_level = self.CRITICAL
+            # ★GPT Minor修正: 通知記憶もCRITICALに合わせる（再起動後の重複通知防止）
+            self._last_notified_level = self.CRITICAL
             logging.info(
                 f"【SDM復元】CRITICAL一時停止を復元 "
                 f"(残り{self.pause_remaining_seconds:.0f}秒)")
