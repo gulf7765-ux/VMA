@@ -1,5 +1,5 @@
 """
-VMA - VM Advance Trading System v5.503
+VMA - VM Advance Trading System v5.504
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 BB背景分析最優先 × Gemini合議 × Python側異常ガード
 
@@ -50,7 +50,7 @@ from dotenv import load_dotenv
 # §1. 定数定義
 # ============================================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-VERSION = "5.503"  # §21 SDM: restore_pause通知記憶同期（GPT Minor対応）
+VERSION = "5.504"  # log_trade_resultにrisk_pips/r_multiple/symbol追加 + charter v2
 
 # --- 通貨ペア ---
 SYMBOL = "USDJPY"
@@ -1643,9 +1643,16 @@ def log_trade_result(tracker: TradeTracker, exit_price: float, exit_reason: str,
         else:
             state.consecutive_losses += 1
 
+        # risk_pips: SL距離（本体のprice_to_pipsで統一計算）
+        risk_pips_val = price_to_pips(abs(tracker.entry_price - tracker.sl_initial))
+        if risk_pips_val <= 0:
+            risk_pips_val = MIN_SL_PIPS  # フォールバック
+        r_multiple = round(result_pips / risk_pips_val, 3)
+
         record = {
             "timestamp": datetime.datetime.now().isoformat(),
             "ticket": tracker.ticket,
+            "symbol": SYMBOL,
             "direction": tracker.direction,
             "council_label": tracker.council_label,
             "entry_price": tracker.entry_price,
@@ -1653,6 +1660,8 @@ def log_trade_result(tracker: TradeTracker, exit_price: float, exit_reason: str,
             "sl_initial": tracker.sl_initial,
             "sl_final": tracker.sl_current,
             "result_pips": round(result_pips, 1),
+            "risk_pips": round(risk_pips_val, 1),
+            "r_multiple": r_multiple,
             "hold_minutes": round(hold_seconds / 60, 1),
             "max_favorable_pips": round(tracker.max_favorable_pips, 1),
             "max_adverse_pips": round(tracker.max_adverse_pips, 1),

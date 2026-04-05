@@ -1,10 +1,11 @@
 """
-VMA Analyzer v5.503
+VMA Analyzer v5.504
 - SQLite + JSONL dual source
 - Equity curve / DD curve / distribution charts
 - EV dynamics with regime detection
-- Time-of-day / council label / slippage breakdown
-- Single-file PNG report output
+- Time-of-day / council label / exit reason / slippage breakdown
+- Single-file 7-panel PNG report output
+- r_multiple/risk_pips は本体(vma_bot.py)の保存値を読むだけ（真実は1か所）
 """
 
 import os
@@ -126,7 +127,7 @@ def load_council_logs() -> pd.DataFrame:
 # 前処理
 # ============================================================================
 
-def preprocess(df: pd.DataFrame, council_df: pd.DataFrame) -> pd.DataFrame:
+def preprocess(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
 
@@ -142,8 +143,8 @@ def preprocess(df: pd.DataFrame, council_df: pd.DataFrame) -> pd.DataFrame:
 
     # 必須カラム確認・補完
     for col, default in [
-        ("result_pips", 0.0), ("win", False),
-        ("hold_minutes", 0.0), ("slippage_pips", 0.0),
+        ("result_pips", 0.0), ("risk_pips", 5.0), ("r_multiple", 0.0),
+        ("win", False), ("hold_minutes", 0.0), ("slippage_pips", 0.0),
         ("direction", "UNKNOWN"), ("council_label", ""),
         ("exit_reason", "unknown"), ("max_favorable_pips", 0.0),
         ("max_adverse_pips", 0.0),
@@ -151,21 +152,12 @@ def preprocess(df: pd.DataFrame, council_df: pd.DataFrame) -> pd.DataFrame:
         if col not in df.columns:
             df[col] = default
 
-    # risk_pips: SL距離をpips換算（r_multiple算出用）
-    # VMAのトレードレコードにはsl_initial, entry_priceがある
-    if "risk_pips" not in df.columns:
-        if "sl_initial" in df.columns and "entry_price" in df.columns:
-            # USDJPY想定: 1pip = 0.01 (3桁) or 0.001 (5桁)
-            df["risk_pips"] = (df["entry_price"] - df["sl_initial"]).abs()
-            # 価格差をpips変換（USDJPYは100倍でpips）
-            df["risk_pips"] = df["risk_pips"] * 100.0
-            df["risk_pips"] = df["risk_pips"].replace(0, np.nan).fillna(5.0)
-        else:
-            df["risk_pips"] = 5.0  # フォールバック
-
-    # r_multiple算出: result_pips / risk_pips
-    if "r_multiple" not in df.columns:
-        df["r_multiple"] = df["result_pips"] / df["risk_pips"].replace(0, np.nan).fillna(5.0)
+    # ★r_multipleは本体(vma_bot.py)が約定時に計算・保存した値をそのまま使う。
+    # analyzer側で再計算しない（真実は1か所）。
+    # 旧レコード互換: r_multipleが0かつresult_pipsが非0なら、risk_pipsから復元を試みる
+    mask = (df["r_multiple"] == 0) & (df["result_pips"] != 0) & (df["risk_pips"] > 0)
+    if mask.any():
+        df.loc[mask, "r_multiple"] = df.loc[mask, "result_pips"] / df.loc[mask, "risk_pips"]
 
     # win を bool 化（result_pips基準）
     df["win"] = df["result_pips"] > 0
@@ -451,7 +443,7 @@ def analyze_mfe_mae(df: pd.DataFrame, out: list):
 # ============================================================================
 
 def generate_report_chart(df: pd.DataFrame, stats: Dict, ev_df: Optional[pd.DataFrame]):
-    """6パネルPNGレポート"""
+    """7パネルPNGレポート"""
 
     fig = plt.figure(figsize=(18, 14), facecolor="white")
     fig.suptitle(
@@ -487,7 +479,7 @@ def generate_report_chart(df: pd.DataFrame, stats: Dict, ev_df: Optional[pd.Data
         f"Sharpe(R): {stats['sharpe_r']:.3f}",
         f"Profit Factor: {pf_display}",
         f"Max DD (R): {stats['max_dd_r']:.2f}",
-        f"Max DD (%): {stats['max_dd_pct']:.1%}",
+        f"Max DD (%): {stats['max_dd_pct']:.1%} (2%固定)",
         f"",
         f"Avg Win R: {stats['avg_win_r']:+.2f}",
         f"Avg Loss R: {stats['avg_loss_r']:+.2f}",
@@ -516,12 +508,12 @@ def generate_report_chart(df: pd.DataFrame, stats: Dict, ev_df: Optional[pd.Data
     ax3.legend(fontsize=8)
     ax3.grid(True, alpha=0.3)
 
-    # --- Panel 4: Capital Drawdown ---
+    # --- Panel 4: Capital Drawdown (固定リスク基準) ---
     ax4 = fig.add_subplot(gs[1, 1])
     cap_dd = stats["capital_dd"]
     ax4.fill_between(range(len(cap_dd)), -cap_dd * 100, 0, color="#F44336", alpha=0.4)
     ax4.plot(range(len(cap_dd)), -cap_dd * 100, color="#F44336", linewidth=1.0)
-    ax4.set_title("Capital Drawdown (%)", fontsize=11)
+    ax4.set_title("Capital Drawdown (固定2%基準・正規化)", fontsize=11)
     ax4.set_xlabel("Trade #")
     ax4.set_ylabel("DD %")
     ax4.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f"{x:.1f}%"))
@@ -592,7 +584,7 @@ def generate_report_chart(df: pd.DataFrame, stats: Dict, ev_df: Optional[pd.Data
 
 def analyze_performance():
     print("=" * 64)
-    print("  VMA Analyzer v5.503")
+    print("  VMA Analyzer v5.504")
     print("=" * 64)
 
     # --- Load ---
@@ -607,7 +599,7 @@ def analyze_performance():
     if not council_df.empty:
         print(f"  Council logs: {len(council_df)} entries")
 
-    df = preprocess(raw_df, council_df)
+    df = preprocess(raw_df)
 
     if len(df) < 3:
         print("  有効なトレードが不足。終了。")
@@ -628,7 +620,7 @@ def analyze_performance():
     pf_str = f"{stats['profit_factor']:.2f}" if stats['profit_factor'] < 100 else "∞"
     out.append(f"  Profit Factor: {pf_str}")
     out.append(f"  Max DD (R)   : {stats['max_dd_r']:.2f}")
-    out.append(f"  Max DD (%)   : {stats['max_dd_pct']:.1%}")
+    out.append(f"  Max DD (%)   : {stats['max_dd_pct']:.1%} (固定2%基準・正規化)")
     out.append(f"  Avg Win R    : {stats['avg_win_r']:+.2f}")
     out.append(f"  Avg Loss R   : {stats['avg_loss_r']:+.2f}")
     out.append(f"  Skew / Kurt  : {stats['skew_r']:+.2f} / {stats['kurtosis_r']:.2f}")
@@ -658,7 +650,7 @@ def analyze_performance():
     # --- Save text report ---
     try:
         with open(REPORT_TEXT, "w", encoding="utf-8") as f:
-            f.write(f"VMA Analyzer v5.503 — {datetime.now().isoformat()}\n")
+            f.write(f"VMA Analyzer v5.504 — {datetime.now().isoformat()}\n")
             f.write("=" * 64 + "\n")
             f.write(report_text)
             f.write("\n")
